@@ -41,7 +41,1300 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
     }var i = typeof require == "function" && require;for (var o = 0; o < r.length; o++) {
       s(r[o]);
     }return s;
-  }({ 1: [function (require, module, exports) {}, {}], 2: [function (require, module, exports) {
+  }({ 1: [function (require, module, exports) {
+      (function (process, Buffer) {
+        'use strict';
+
+        // Load modules
+
+        var Punycode = require('punycode');
+
+        // Declare internals
+
+        var internals = {
+          hasOwn: Object.prototype.hasOwnProperty,
+          indexOf: Array.prototype.indexOf,
+          defaultThreshold: 16,
+          maxIPv6Groups: 8,
+
+          categories: {
+            valid: 1,
+            dnsWarn: 7,
+            rfc5321: 15,
+            cfws: 31,
+            deprecated: 63,
+            rfc5322: 127,
+            error: 255
+          },
+
+          diagnoses: {
+
+            // Address is valid
+
+            valid: 0,
+
+            // Address is valid for SMTP but has unusual elements
+
+            rfc5321TLD: 9,
+            rfc5321TLDNumeric: 10,
+            rfc5321QuotedString: 11,
+            rfc5321AddressLiteral: 12,
+
+            // Address is valid for message, but must be modified for envelope
+
+            cfwsComment: 17,
+            cfwsFWS: 18,
+
+            // Address contains deprecated elements, but may still be valid in some contexts
+
+            deprecatedLocalPart: 33,
+            deprecatedFWS: 34,
+            deprecatedQTEXT: 35,
+            deprecatedQP: 36,
+            deprecatedComment: 37,
+            deprecatedCTEXT: 38,
+            deprecatedIPv6: 39,
+            deprecatedCFWSNearAt: 49,
+
+            // Address is only valid according to broad definition in RFC 5322, but is otherwise invalid
+
+            rfc5322Domain: 65,
+            rfc5322TooLong: 66,
+            rfc5322LocalTooLong: 67,
+            rfc5322DomainTooLong: 68,
+            rfc5322LabelTooLong: 69,
+            rfc5322DomainLiteral: 70,
+            rfc5322DomainLiteralOBSDText: 71,
+            rfc5322IPv6GroupCount: 72,
+            rfc5322IPv62x2xColon: 73,
+            rfc5322IPv6BadCharacter: 74,
+            rfc5322IPv6MaxGroups: 75,
+            rfc5322IPv6ColonStart: 76,
+            rfc5322IPv6ColonEnd: 77,
+
+            // Address is invalid for any purpose
+
+            errExpectingDTEXT: 129,
+            errNoLocalPart: 130,
+            errNoDomain: 131,
+            errConsecutiveDots: 132,
+            errATEXTAfterCFWS: 133,
+            errATEXTAfterQS: 134,
+            errATEXTAfterDomainLiteral: 135,
+            errExpectingQPair: 136,
+            errExpectingATEXT: 137,
+            errExpectingQTEXT: 138,
+            errExpectingCTEXT: 139,
+            errBackslashEnd: 140,
+            errDotStart: 141,
+            errDotEnd: 142,
+            errDomainHyphenStart: 143,
+            errDomainHyphenEnd: 144,
+            errUnclosedQuotedString: 145,
+            errUnclosedComment: 146,
+            errUnclosedDomainLiteral: 147,
+            errFWSCRLFx2: 148,
+            errFWSCRLFEnd: 149,
+            errCRNoLF: 150,
+            errUnknownTLD: 160,
+            errDomainTooShort: 161
+          },
+
+          components: {
+            localpart: 0,
+            domain: 1,
+            literal: 2,
+            contextComment: 3,
+            contextFWS: 4,
+            contextQuotedString: 5,
+            contextQuotedPair: 6
+          }
+        };
+
+        internals.specials = function () {
+
+          var specials = '()<>[]:;@\\,."'; // US-ASCII visible characters not valid for atext (http://tools.ietf.org/html/rfc5322#section-3.2.3)
+          var lookup = new Array(0x100);
+          lookup.fill(false);
+
+          for (var i = 0; i < specials.length; ++i) {
+            lookup[specials.codePointAt(i)] = true;
+          }
+
+          return function (code) {
+
+            return lookup[code];
+          };
+        }();
+
+        internals.c0Controls = function () {
+
+          var lookup = new Array(0x100);
+          lookup.fill(false);
+
+          // add C0 control characters
+
+          for (var i = 0; i < 33; ++i) {
+            lookup[i] = true;
+          }
+
+          return function (code) {
+
+            return lookup[code];
+          };
+        }();
+
+        internals.c1Controls = function () {
+
+          var lookup = new Array(0x100);
+          lookup.fill(false);
+
+          // add C1 control characters
+
+          for (var i = 127; i < 160; ++i) {
+            lookup[i] = true;
+          }
+
+          return function (code) {
+
+            return lookup[code];
+          };
+        }();
+
+        internals.regex = {
+          ipV4: /\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)$/,
+          ipV6: /^[a-fA-F\d]{0,4}$/
+        };
+
+        // $lab:coverage:off$
+        internals.nulNormalize = function (email) {
+
+          var emailPieces = email.split("\0");
+          emailPieces = emailPieces.map(function (string) {
+
+            return string.normalize('NFC');
+          });
+
+          return emailPieces.join("\0");
+        };
+        // $lab:coverage:on$
+
+
+        internals.checkIpV6 = function (items) {
+
+          return items.every(function (value) {
+            return internals.regex.ipV6.test(value);
+          });
+        };
+
+        internals.validDomain = function (tldAtom, options) {
+
+          if (options.tldBlacklist) {
+            if (Array.isArray(options.tldBlacklist)) {
+              return internals.indexOf.call(options.tldBlacklist, tldAtom) === -1;
+            }
+
+            return !internals.hasOwn.call(options.tldBlacklist, tldAtom);
+          }
+
+          if (Array.isArray(options.tldWhitelist)) {
+            return internals.indexOf.call(options.tldWhitelist, tldAtom) !== -1;
+          }
+
+          return internals.hasOwn.call(options.tldWhitelist, tldAtom);
+        };
+
+        /**
+         * Check that an email address conforms to RFCs 5321, 5322, 6530 and others
+         *
+         * We distinguish clearly between a Mailbox as defined by RFC 5321 and an
+         * addr-spec as defined by RFC 5322. Depending on the context, either can be
+         * regarded as a valid email address. The RFC 5321 Mailbox specification is
+         * more restrictive (comments, white space and obsolete forms are not allowed).
+         *
+         * @param {string} email The email address to check. See README for specifics.
+         * @param {Object} options The (optional) options:
+         *   {*} errorLevel Determines the boundary between valid and invalid
+         *     addresses.
+         *   {*} tldBlacklist The set of domains to consider invalid.
+         *   {*} tldWhitelist The set of domains to consider valid.
+         *   {*} minDomainAtoms The minimum number of domain atoms which must be present
+         *     for the address to be valid.
+         * @param {function(number|boolean)} callback The (optional) callback handler.
+         * @return {*}
+         */
+
+        exports.validate = internals.validate = function (email, options, callback) {
+
+          options = options || {};
+          email = internals.normalize(email);
+
+          if (typeof options === 'function') {
+            callback = options;
+            options = {};
+          }
+
+          if (typeof callback !== 'function') {
+            callback = null;
+          }
+
+          var diagnose = void 0;
+          var threshold = void 0;
+
+          if (typeof options.errorLevel === 'number') {
+            diagnose = true;
+            threshold = options.errorLevel;
+          } else {
+            diagnose = !!options.errorLevel;
+            threshold = internals.diagnoses.valid;
+          }
+
+          if (options.tldWhitelist) {
+            if (typeof options.tldWhitelist === 'string') {
+              options.tldWhitelist = [options.tldWhitelist];
+            } else if (_typeof(options.tldWhitelist) !== 'object') {
+              throw new TypeError('expected array or object tldWhitelist');
+            }
+          }
+
+          if (options.tldBlacklist) {
+            if (typeof options.tldBlacklist === 'string') {
+              options.tldBlacklist = [options.tldBlacklist];
+            } else if (_typeof(options.tldBlacklist) !== 'object') {
+              throw new TypeError('expected array or object tldBlacklist');
+            }
+          }
+
+          if (options.minDomainAtoms && (options.minDomainAtoms !== (+options.minDomainAtoms | 0) || options.minDomainAtoms < 0)) {
+            throw new TypeError('expected positive integer minDomainAtoms');
+          }
+
+          var maxResult = internals.diagnoses.valid;
+          var updateResult = function updateResult(value) {
+
+            if (value > maxResult) {
+              maxResult = value;
+            }
+          };
+
+          var context = {
+            now: internals.components.localpart,
+            prev: internals.components.localpart,
+            stack: [internals.components.localpart]
+          };
+
+          var prevToken = '';
+
+          var parseData = {
+            local: '',
+            domain: ''
+          };
+          var atomData = {
+            locals: [''],
+            domains: ['']
+          };
+
+          var elementCount = 0;
+          var elementLength = 0;
+          var crlfCount = 0;
+          var charCode = void 0;
+
+          var hyphenFlag = false;
+          var assertEnd = false;
+
+          var emailLength = email.length;
+
+          var token = void 0; // Token is used outside the loop, must declare similarly
+          for (var i = 0; i < emailLength; i += token.length) {
+            // Utilize codepoints to account for Unicode surrogate pairs
+            token = String.fromCodePoint(email.codePointAt(i));
+
+            switch (context.now) {
+              // Local-part
+              case internals.components.localpart:
+                // http://tools.ietf.org/html/rfc5322#section-3.4.1
+                //   local-part      =   dot-atom / quoted-string / obs-local-part
+                //
+                //   dot-atom        =   [CFWS] dot-atom-text [CFWS]
+                //
+                //   dot-atom-text   =   1*atext *("." 1*atext)
+                //
+                //   quoted-string   =   [CFWS]
+                //                       DQUOTE *([FWS] qcontent) [FWS] DQUOTE
+                //                       [CFWS]
+                //
+                //   obs-local-part  =   word *("." word)
+                //
+                //   word            =   atom / quoted-string
+                //
+                //   atom            =   [CFWS] 1*atext [CFWS]
+                switch (token) {
+                  // Comment
+                  case '(':
+                    if (elementLength === 0) {
+                      // Comments are OK at the beginning of an element
+                      updateResult(elementCount === 0 ? internals.diagnoses.cfwsComment : internals.diagnoses.deprecatedComment);
+                    } else {
+                      updateResult(internals.diagnoses.cfwsComment);
+                      // Cannot start a comment in an element, should be end
+                      assertEnd = true;
+                    }
+
+                    context.stack.push(context.now);
+                    context.now = internals.components.contextComment;
+                    break;
+
+                  // Next dot-atom element
+                  case '.':
+                    if (elementLength === 0) {
+                      // Another dot, already?
+                      updateResult(elementCount === 0 ? internals.diagnoses.errDotStart : internals.diagnoses.errConsecutiveDots);
+                    } else {
+                      // The entire local-part can be a quoted string for RFC 5321; if one atom is quoted it's an RFC 5322 obsolete form
+                      if (assertEnd) {
+                        updateResult(internals.diagnoses.deprecatedLocalPart);
+                      }
+
+                      // CFWS & quoted strings are OK again now we're at the beginning of an element (although they are obsolete forms)
+                      assertEnd = false;
+                      elementLength = 0;
+                      ++elementCount;
+                      parseData.local += token;
+                      atomData.locals[elementCount] = '';
+                    }
+
+                    break;
+
+                  // Quoted string
+                  case '"':
+                    if (elementLength === 0) {
+                      // The entire local-part can be a quoted string for RFC 5321; if one atom is quoted it's an RFC 5322 obsolete form
+                      updateResult(elementCount === 0 ? internals.diagnoses.rfc5321QuotedString : internals.diagnoses.deprecatedLocalPart);
+
+                      parseData.local += token;
+                      atomData.locals[elementCount] += token;
+                      elementLength += Buffer.byteLength(token, 'utf8');
+
+                      // Quoted string must be the entire element
+                      assertEnd = true;
+                      context.stack.push(context.now);
+                      context.now = internals.components.contextQuotedString;
+                    } else {
+                      updateResult(internals.diagnoses.errExpectingATEXT);
+                    }
+
+                    break;
+
+                  // Folding white space
+                  case '\r':
+                    if (emailLength === ++i || email[i] !== '\n') {
+                      // Fatal error
+                      updateResult(internals.diagnoses.errCRNoLF);
+                      break;
+                    }
+
+                  // Fallthrough
+
+                  case ' ':
+                  case '\t':
+                    if (elementLength === 0) {
+                      updateResult(elementCount === 0 ? internals.diagnoses.cfwsFWS : internals.diagnoses.deprecatedFWS);
+                    } else {
+                      // We can't start FWS in the middle of an element, better be end
+                      assertEnd = true;
+                    }
+
+                    context.stack.push(context.now);
+                    context.now = internals.components.contextFWS;
+                    prevToken = token;
+                    break;
+
+                  case '@':
+                    // At this point we should have a valid local-part
+                    // $lab:coverage:off$
+                    if (context.stack.length !== 1) {
+                      throw new Error('unexpected item on context stack');
+                    }
+                    // $lab:coverage:on$
+
+                    if (parseData.local.length === 0) {
+                      // Fatal error
+                      updateResult(internals.diagnoses.errNoLocalPart);
+                    } else if (elementLength === 0) {
+                      // Fatal error
+                      updateResult(internals.diagnoses.errDotEnd);
+                    }
+                    // http://tools.ietf.org/html/rfc5321#section-4.5.3.1.1 the maximum total length of a user name or other local-part is 64
+                    //    octets
+                    else if (Buffer.byteLength(parseData.local, 'utf8') > 64) {
+                        updateResult(internals.diagnoses.rfc5322LocalTooLong);
+                      }
+                      // http://tools.ietf.org/html/rfc5322#section-3.4.1 comments and folding white space SHOULD NOT be used around "@" in the
+                      //    addr-spec
+                      //
+                      // http://tools.ietf.org/html/rfc2119
+                      // 4. SHOULD NOT this phrase, or the phrase "NOT RECOMMENDED" mean that there may exist valid reasons in particular
+                      //    circumstances when the particular behavior is acceptable or even useful, but the full implications should be understood
+                      //    and the case carefully weighed before implementing any behavior described with this label.
+                      else if (context.prev === internals.components.contextComment || context.prev === internals.components.contextFWS) {
+                          updateResult(internals.diagnoses.deprecatedCFWSNearAt);
+                        }
+
+                    // Clear everything down for the domain parsing
+                    context.now = internals.components.domain;
+                    context.stack[0] = internals.components.domain;
+                    elementCount = 0;
+                    elementLength = 0;
+                    assertEnd = false; // CFWS can only appear at the end of the element
+                    break;
+
+                  // ATEXT
+                  default:
+                    // http://tools.ietf.org/html/rfc5322#section-3.2.3
+                    //    atext = ALPHA / DIGIT / ; Printable US-ASCII
+                    //            "!" / "#" /     ;  characters not including
+                    //            "$" / "%" /     ;  specials.  Used for atoms.
+                    //            "&" / "'" /
+                    //            "*" / "+" /
+                    //            "-" / "/" /
+                    //            "=" / "?" /
+                    //            "^" / "_" /
+                    //            "`" / "{" /
+                    //            "|" / "}" /
+                    //            "~"
+                    if (assertEnd) {
+                      // We have encountered atext where it is no longer valid
+                      switch (context.prev) {
+                        case internals.components.contextComment:
+                        case internals.components.contextFWS:
+                          updateResult(internals.diagnoses.errATEXTAfterCFWS);
+                          break;
+
+                        case internals.components.contextQuotedString:
+                          updateResult(internals.diagnoses.errATEXTAfterQS);
+                          break;
+
+                        // $lab:coverage:off$
+                        default:
+                          throw new Error('more atext found where none is allowed, but unrecognized prev context: ' + context.prev);
+                        // $lab:coverage:on$
+                      }
+                    } else {
+                      context.prev = context.now;
+                      charCode = token.codePointAt(0);
+
+                      // Especially if charCode == 10
+                      if (internals.specials(charCode) || internals.c0Controls(charCode) || internals.c1Controls(charCode)) {
+
+                        // Fatal error
+                        updateResult(internals.diagnoses.errExpectingATEXT);
+                      }
+
+                      parseData.local += token;
+                      atomData.locals[elementCount] += token;
+                      elementLength += Buffer.byteLength(token, 'utf8');
+                    }
+                }
+
+                break;
+
+              case internals.components.domain:
+                // http://tools.ietf.org/html/rfc5322#section-3.4.1
+                //   domain          =   dot-atom / domain-literal / obs-domain
+                //
+                //   dot-atom        =   [CFWS] dot-atom-text [CFWS]
+                //
+                //   dot-atom-text   =   1*atext *("." 1*atext)
+                //
+                //   domain-literal  =   [CFWS] "[" *([FWS] dtext) [FWS] "]" [CFWS]
+                //
+                //   dtext           =   %d33-90 /          ; Printable US-ASCII
+                //                       %d94-126 /         ;  characters not including
+                //                       obs-dtext          ;  "[", "]", or "\"
+                //
+                //   obs-domain      =   atom *("." atom)
+                //
+                //   atom            =   [CFWS] 1*atext [CFWS]
+
+                // http://tools.ietf.org/html/rfc5321#section-4.1.2
+                //   Mailbox        = Local-part "@" ( Domain / address-literal )
+                //
+                //   Domain         = sub-domain *("." sub-domain)
+                //
+                //   address-literal  = "[" ( IPv4-address-literal /
+                //                    IPv6-address-literal /
+                //                    General-address-literal ) "]"
+                //                    ; See Section 4.1.3
+
+                // http://tools.ietf.org/html/rfc5322#section-3.4.1
+                //      Note: A liberal syntax for the domain portion of addr-spec is
+                //      given here.  However, the domain portion contains addressing
+                //      information specified by and used in other protocols (e.g.,
+                //      [RFC1034], [RFC1035], [RFC1123], [RFC5321]).  It is therefore
+                //      incumbent upon implementations to conform to the syntax of
+                //      addresses for the context in which they are used.
+                //
+                // is_email() author's note: it's not clear how to interpret this in
+                // he context of a general email address validator. The conclusion I
+                // have reached is this: "addressing information" must comply with
+                // RFC 5321 (and in turn RFC 1035), anything that is "semantically
+                // invisible" must comply only with RFC 5322.
+                switch (token) {
+                  // Comment
+                  case '(':
+                    if (elementLength === 0) {
+                      // Comments at the start of the domain are deprecated in the text, comments at the start of a subdomain are obs-domain
+                      // http://tools.ietf.org/html/rfc5322#section-3.4.1
+                      updateResult(elementCount === 0 ? internals.diagnoses.deprecatedCFWSNearAt : internals.diagnoses.deprecatedComment);
+                    } else {
+                      // We can't start a comment mid-element, better be at the end
+                      assertEnd = true;
+                      updateResult(internals.diagnoses.cfwsComment);
+                    }
+
+                    context.stack.push(context.now);
+                    context.now = internals.components.contextComment;
+                    break;
+
+                  // Next dot-atom element
+                  case '.':
+                    var punycodeLength = Punycode.encode(atomData.domains[elementCount]).length;
+                    if (elementLength === 0) {
+                      // Another dot, already? Fatal error.
+                      updateResult(elementCount === 0 ? internals.diagnoses.errDotStart : internals.diagnoses.errConsecutiveDots);
+                    } else if (hyphenFlag) {
+                      // Previous subdomain ended in a hyphen. Fatal error.
+                      updateResult(internals.diagnoses.errDomainHyphenEnd);
+                    } else if (punycodeLength > 63) {
+                      // RFC 5890 specifies that domain labels that are encoded using the Punycode algorithm
+                      // must adhere to the <= 63 octet requirement.
+                      // This includes string prefixes from the Punycode algorithm.
+                      //
+                      // https://tools.ietf.org/html/rfc5890#section-2.3.2.1
+                      // labels          63 octets or less
+
+                      updateResult(internals.diagnoses.rfc5322LabelTooLong);
+                    }
+
+                    // CFWS is OK again now we're at the beginning of an element (although
+                    // it may be obsolete CFWS)
+                    assertEnd = false;
+                    elementLength = 0;
+                    ++elementCount;
+                    atomData.domains[elementCount] = '';
+                    parseData.domain += token;
+
+                    break;
+
+                  // Domain literal
+                  case '[':
+                    if (parseData.domain.length === 0) {
+                      // Domain literal must be the only component
+                      assertEnd = true;
+                      elementLength += Buffer.byteLength(token, 'utf8');
+                      context.stack.push(context.now);
+                      context.now = internals.components.literal;
+                      parseData.domain += token;
+                      atomData.domains[elementCount] += token;
+                      parseData.literal = '';
+                    } else {
+                      // Fatal error
+                      updateResult(internals.diagnoses.errExpectingATEXT);
+                    }
+
+                    break;
+
+                  // Folding white space
+                  case '\r':
+                    if (emailLength === ++i || email[i] !== '\n') {
+                      // Fatal error
+                      updateResult(internals.diagnoses.errCRNoLF);
+                      break;
+                    }
+
+                  // Fallthrough
+
+                  case ' ':
+                  case '\t':
+                    if (elementLength === 0) {
+                      updateResult(elementCount === 0 ? internals.diagnoses.deprecatedCFWSNearAt : internals.diagnoses.deprecatedFWS);
+                    } else {
+                      // We can't start FWS in the middle of an element, so this better be the end
+                      updateResult(internals.diagnoses.cfwsFWS);
+                      assertEnd = true;
+                    }
+
+                    context.stack.push(context.now);
+                    context.now = internals.components.contextFWS;
+                    prevToken = token;
+                    break;
+
+                  // This must be ATEXT
+                  default:
+                    // RFC 5322 allows any atext...
+                    // http://tools.ietf.org/html/rfc5322#section-3.2.3
+                    //    atext = ALPHA / DIGIT / ; Printable US-ASCII
+                    //            "!" / "#" /     ;  characters not including
+                    //            "$" / "%" /     ;  specials.  Used for atoms.
+                    //            "&" / "'" /
+                    //            "*" / "+" /
+                    //            "-" / "/" /
+                    //            "=" / "?" /
+                    //            "^" / "_" /
+                    //            "`" / "{" /
+                    //            "|" / "}" /
+                    //            "~"
+
+                    // But RFC 5321 only allows letter-digit-hyphen to comply with DNS rules
+                    //   (RFCs 1034 & 1123)
+                    // http://tools.ietf.org/html/rfc5321#section-4.1.2
+                    //   sub-domain     = Let-dig [Ldh-str]
+                    //
+                    //   Let-dig        = ALPHA / DIGIT
+                    //
+                    //   Ldh-str        = *( ALPHA / DIGIT / "-" ) Let-dig
+                    //
+                    if (assertEnd) {
+                      // We have encountered ATEXT where it is no longer valid
+                      switch (context.prev) {
+                        case internals.components.contextComment:
+                        case internals.components.contextFWS:
+                          updateResult(internals.diagnoses.errATEXTAfterCFWS);
+                          break;
+
+                        case internals.components.literal:
+                          updateResult(internals.diagnoses.errATEXTAfterDomainLiteral);
+                          break;
+
+                        // $lab:coverage:off$
+                        default:
+                          throw new Error('more atext found where none is allowed, but unrecognized prev context: ' + context.prev);
+                        // $lab:coverage:on$
+                      }
+                    }
+
+                    charCode = token.codePointAt(0);
+                    // Assume this token isn't a hyphen unless we discover it is
+                    hyphenFlag = false;
+
+                    if (internals.specials(charCode) || internals.c0Controls(charCode) || internals.c1Controls(charCode)) {
+                      // Fatal error
+                      updateResult(internals.diagnoses.errExpectingATEXT);
+                    } else if (token === '-') {
+                      if (elementLength === 0) {
+                        // Hyphens cannot be at the beginning of a subdomain, fatal error
+                        updateResult(internals.diagnoses.errDomainHyphenStart);
+                      }
+
+                      hyphenFlag = true;
+                    }
+                    // Check if it's a neither a number nor a latin/unicode letter
+                    else if (charCode < 48 || charCode > 122 && charCode < 192 || charCode > 57 && charCode < 65 || charCode > 90 && charCode < 97) {
+                        // This is not an RFC 5321 subdomain, but still OK by RFC 5322
+                        updateResult(internals.diagnoses.rfc5322Domain);
+                      }
+
+                    parseData.domain += token;
+                    atomData.domains[elementCount] += token;
+                    elementLength += Buffer.byteLength(token, 'utf8');
+                }
+
+                break;
+
+              // Domain literal
+              case internals.components.literal:
+                // http://tools.ietf.org/html/rfc5322#section-3.4.1
+                //   domain-literal  =   [CFWS] "[" *([FWS] dtext) [FWS] "]" [CFWS]
+                //
+                //   dtext           =   %d33-90 /          ; Printable US-ASCII
+                //                       %d94-126 /         ;  characters not including
+                //                       obs-dtext          ;  "[", "]", or "\"
+                //
+                //   obs-dtext       =   obs-NO-WS-CTL / quoted-pair
+                switch (token) {
+                  // End of domain literal
+                  case ']':
+                    if (maxResult < internals.categories.deprecated) {
+                      // Could be a valid RFC 5321 address literal, so let's check
+
+                      // http://tools.ietf.org/html/rfc5321#section-4.1.2
+                      //   address-literal  = "[" ( IPv4-address-literal /
+                      //                    IPv6-address-literal /
+                      //                    General-address-literal ) "]"
+                      //                    ; See Section 4.1.3
+                      //
+                      // http://tools.ietf.org/html/rfc5321#section-4.1.3
+                      //   IPv4-address-literal  = Snum 3("."  Snum)
+                      //
+                      //   IPv6-address-literal  = "IPv6:" IPv6-addr
+                      //
+                      //   General-address-literal  = Standardized-tag ":" 1*dcontent
+                      //
+                      //   Standardized-tag  = Ldh-str
+                      //                     ; Standardized-tag MUST be specified in a
+                      //                     ; Standards-Track RFC and registered with IANA
+                      //
+                      //   dcontent      = %d33-90 / ; Printable US-ASCII
+                      //                 %d94-126 ; excl. "[", "\", "]"
+                      //
+                      //   Snum          = 1*3DIGIT
+                      //                 ; representing a decimal integer
+                      //                 ; value in the range 0 through 255
+                      //
+                      //   IPv6-addr     = IPv6-full / IPv6-comp / IPv6v4-full / IPv6v4-comp
+                      //
+                      //   IPv6-hex      = 1*4HEXDIG
+                      //
+                      //   IPv6-full     = IPv6-hex 7(":" IPv6-hex)
+                      //
+                      //   IPv6-comp     = [IPv6-hex *5(":" IPv6-hex)] "::"
+                      //                 [IPv6-hex *5(":" IPv6-hex)]
+                      //                 ; The "::" represents at least 2 16-bit groups of
+                      //                 ; zeros.  No more than 6 groups in addition to the
+                      //                 ; "::" may be present.
+                      //
+                      //   IPv6v4-full   = IPv6-hex 5(":" IPv6-hex) ":" IPv4-address-literal
+                      //
+                      //   IPv6v4-comp   = [IPv6-hex *3(":" IPv6-hex)] "::"
+                      //                 [IPv6-hex *3(":" IPv6-hex) ":"]
+                      //                 IPv4-address-literal
+                      //                 ; The "::" represents at least 2 16-bit groups of
+                      //                 ; zeros.  No more than 4 groups in addition to the
+                      //                 ; "::" and IPv4-address-literal may be present.
+
+                      var index = -1;
+                      var addressLiteral = parseData.literal;
+                      var matchesIP = internals.regex.ipV4.exec(addressLiteral);
+
+                      // Maybe extract IPv4 part from the end of the address-literal
+                      if (matchesIP) {
+                        index = matchesIP.index;
+                        if (index !== 0) {
+                          // Convert IPv4 part to IPv6 format for futher testing
+                          addressLiteral = addressLiteral.slice(0, index) + '0:0';
+                        }
+                      }
+
+                      if (index === 0) {
+                        // Nothing there except a valid IPv4 address, so...
+                        updateResult(internals.diagnoses.rfc5321AddressLiteral);
+                      } else if (addressLiteral.slice(0, 5).toLowerCase() !== 'ipv6:') {
+                        updateResult(internals.diagnoses.rfc5322DomainLiteral);
+                      } else {
+                        var match = addressLiteral.slice(5);
+                        var maxGroups = internals.maxIPv6Groups;
+                        var groups = match.split(':');
+                        index = match.indexOf('::');
+
+                        if (!~index) {
+                          // Need exactly the right number of groups
+                          if (groups.length !== maxGroups) {
+                            updateResult(internals.diagnoses.rfc5322IPv6GroupCount);
+                          }
+                        } else if (index !== match.lastIndexOf('::')) {
+                          updateResult(internals.diagnoses.rfc5322IPv62x2xColon);
+                        } else {
+                          if (index === 0 || index === match.length - 2) {
+                            // RFC 4291 allows :: at the start or end of an address with 7 other groups in addition
+                            ++maxGroups;
+                          }
+
+                          if (groups.length > maxGroups) {
+                            updateResult(internals.diagnoses.rfc5322IPv6MaxGroups);
+                          } else if (groups.length === maxGroups) {
+                            // Eliding a single "::"
+                            updateResult(internals.diagnoses.deprecatedIPv6);
+                          }
+                        }
+
+                        // IPv6 testing strategy
+                        if (match[0] === ':' && match[1] !== ':') {
+                          updateResult(internals.diagnoses.rfc5322IPv6ColonStart);
+                        } else if (match[match.length - 1] === ':' && match[match.length - 2] !== ':') {
+                          updateResult(internals.diagnoses.rfc5322IPv6ColonEnd);
+                        } else if (internals.checkIpV6(groups)) {
+                          updateResult(internals.diagnoses.rfc5321AddressLiteral);
+                        } else {
+                          updateResult(internals.diagnoses.rfc5322IPv6BadCharacter);
+                        }
+                      }
+                    } else {
+                      updateResult(internals.diagnoses.rfc5322DomainLiteral);
+                    }
+
+                    parseData.domain += token;
+                    atomData.domains[elementCount] += token;
+                    elementLength += Buffer.byteLength(token, 'utf8');
+                    context.prev = context.now;
+                    context.now = context.stack.pop();
+                    break;
+
+                  case '\\':
+                    updateResult(internals.diagnoses.rfc5322DomainLiteralOBSDText);
+                    context.stack.push(context.now);
+                    context.now = internals.components.contextQuotedPair;
+                    break;
+
+                  // Folding white space
+                  case '\r':
+                    if (emailLength === ++i || email[i] !== '\n') {
+                      updateResult(internals.diagnoses.errCRNoLF);
+                      break;
+                    }
+
+                  // Fallthrough
+
+                  case ' ':
+                  case '\t':
+                    updateResult(internals.diagnoses.cfwsFWS);
+
+                    context.stack.push(context.now);
+                    context.now = internals.components.contextFWS;
+                    prevToken = token;
+                    break;
+
+                  // DTEXT
+                  default:
+                    // http://tools.ietf.org/html/rfc5322#section-3.4.1
+                    //   dtext         =   %d33-90 /  ; Printable US-ASCII
+                    //                     %d94-126 / ;  characters not including
+                    //                     obs-dtext  ;  "[", "]", or "\"
+                    //
+                    //   obs-dtext     =   obs-NO-WS-CTL / quoted-pair
+                    //
+                    //   obs-NO-WS-CTL =   %d1-8 /    ; US-ASCII control
+                    //                     %d11 /     ;  characters that do not
+                    //                     %d12 /     ;  include the carriage
+                    //                     %d14-31 /  ;  return, line feed, and
+                    //                     %d127      ;  white space characters
+                    charCode = token.codePointAt(0);
+
+                    // '\r', '\n', ' ', and '\t' have already been parsed above
+                    if (charCode !== 127 && internals.c1Controls(charCode) || charCode === 0 || token === '[') {
+                      // Fatal error
+                      updateResult(internals.diagnoses.errExpectingDTEXT);
+                      break;
+                    } else if (internals.c0Controls(charCode) || charCode === 127) {
+                      updateResult(internals.diagnoses.rfc5322DomainLiteralOBSDText);
+                    }
+
+                    parseData.literal += token;
+                    parseData.domain += token;
+                    atomData.domains[elementCount] += token;
+                    elementLength += Buffer.byteLength(token, 'utf8');
+                }
+
+                break;
+
+              // Quoted string
+              case internals.components.contextQuotedString:
+                // http://tools.ietf.org/html/rfc5322#section-3.2.4
+                //   quoted-string = [CFWS]
+                //                   DQUOTE *([FWS] qcontent) [FWS] DQUOTE
+                //                   [CFWS]
+                //
+                //   qcontent      = qtext / quoted-pair
+                switch (token) {
+                  // Quoted pair
+                  case '\\':
+                    context.stack.push(context.now);
+                    context.now = internals.components.contextQuotedPair;
+                    break;
+
+                  // Folding white space. Spaces are allowed as regular characters inside a quoted string - it's only FWS if we include '\t' or '\r\n'
+                  case '\r':
+                    if (emailLength === ++i || email[i] !== '\n') {
+                      // Fatal error
+                      updateResult(internals.diagnoses.errCRNoLF);
+                      break;
+                    }
+
+                  // Fallthrough
+
+                  case '\t':
+                    // http://tools.ietf.org/html/rfc5322#section-3.2.2
+                    //   Runs of FWS, comment, or CFWS that occur between lexical tokens in
+                    //   a structured header field are semantically interpreted as a single
+                    //   space character.
+
+                    // http://tools.ietf.org/html/rfc5322#section-3.2.4
+                    //   the CRLF in any FWS/CFWS that appears within the quoted-string [is]
+                    //   semantically "invisible" and therefore not part of the
+                    //   quoted-string
+
+                    parseData.local += ' ';
+                    atomData.locals[elementCount] += ' ';
+                    elementLength += Buffer.byteLength(token, 'utf8');
+
+                    updateResult(internals.diagnoses.cfwsFWS);
+                    context.stack.push(context.now);
+                    context.now = internals.components.contextFWS;
+                    prevToken = token;
+                    break;
+
+                  // End of quoted string
+                  case '"':
+                    parseData.local += token;
+                    atomData.locals[elementCount] += token;
+                    elementLength += Buffer.byteLength(token, 'utf8');
+                    context.prev = context.now;
+                    context.now = context.stack.pop();
+                    break;
+
+                  // QTEXT
+                  default:
+                    // http://tools.ietf.org/html/rfc5322#section-3.2.4
+                    //   qtext          =   %d33 /             ; Printable US-ASCII
+                    //                      %d35-91 /          ;  characters not including
+                    //                      %d93-126 /         ;  "\" or the quote character
+                    //                      obs-qtext
+                    //
+                    //   obs-qtext      =   obs-NO-WS-CTL
+                    //
+                    //   obs-NO-WS-CTL  =   %d1-8 /            ; US-ASCII control
+                    //                      %d11 /             ;  characters that do not
+                    //                      %d12 /             ;  include the carriage
+                    //                      %d14-31 /          ;  return, line feed, and
+                    //                      %d127              ;  white space characters
+                    charCode = token.codePointAt(0);
+
+                    if (charCode !== 127 && internals.c1Controls(charCode) || charCode === 0 || charCode === 10) {
+                      updateResult(internals.diagnoses.errExpectingQTEXT);
+                    } else if (internals.c0Controls(charCode) || charCode === 127) {
+                      updateResult(internals.diagnoses.deprecatedQTEXT);
+                    }
+
+                    parseData.local += token;
+                    atomData.locals[elementCount] += token;
+                    elementLength += Buffer.byteLength(token, 'utf8');
+                }
+
+                // http://tools.ietf.org/html/rfc5322#section-3.4.1
+                //   If the string can be represented as a dot-atom (that is, it contains
+                //   no characters other than atext characters or "." surrounded by atext
+                //   characters), then the dot-atom form SHOULD be used and the quoted-
+                //   string form SHOULD NOT be used.
+
+                break;
+              // Quoted pair
+              case internals.components.contextQuotedPair:
+                // http://tools.ietf.org/html/rfc5322#section-3.2.1
+                //   quoted-pair     =   ("\" (VCHAR / WSP)) / obs-qp
+                //
+                //   VCHAR           =  %d33-126   ; visible (printing) characters
+                //   WSP             =  SP / HTAB  ; white space
+                //
+                //   obs-qp          =   "\" (%d0 / obs-NO-WS-CTL / LF / CR)
+                //
+                //   obs-NO-WS-CTL   =   %d1-8 /   ; US-ASCII control
+                //                       %d11 /    ;  characters that do not
+                //                       %d12 /    ;  include the carriage
+                //                       %d14-31 / ;  return, line feed, and
+                //                       %d127     ;  white space characters
+                //
+                // i.e. obs-qp       =  "\" (%d0-8, %d10-31 / %d127)
+                charCode = token.codePointAt(0);
+
+                if (charCode !== 127 && internals.c1Controls(charCode)) {
+                  // Fatal error
+                  updateResult(internals.diagnoses.errExpectingQPair);
+                } else if (charCode < 31 && charCode !== 9 || charCode === 127) {
+                  // ' ' and '\t' are allowed
+                  updateResult(internals.diagnoses.deprecatedQP);
+                }
+
+                // At this point we know where this qpair occurred so we could check to see if the character actually needed to be quoted at all.
+                // http://tools.ietf.org/html/rfc5321#section-4.1.2
+                //   the sending system SHOULD transmit the form that uses the minimum quoting possible.
+
+                context.prev = context.now;
+                // End of qpair
+                context.now = context.stack.pop();
+                var escapeToken = '\\' + token;
+
+                switch (context.now) {
+                  case internals.components.contextComment:
+                    break;
+
+                  case internals.components.contextQuotedString:
+                    parseData.local += escapeToken;
+                    atomData.locals[elementCount] += escapeToken;
+
+                    // The maximum sizes specified by RFC 5321 are octet counts, so we must include the backslash
+                    elementLength += 2;
+                    break;
+
+                  case internals.components.literal:
+                    parseData.domain += escapeToken;
+                    atomData.domains[elementCount] += escapeToken;
+
+                    // The maximum sizes specified by RFC 5321 are octet counts, so we must include the backslash
+                    elementLength += 2;
+                    break;
+
+                  // $lab:coverage:off$
+                  default:
+                    throw new Error('quoted pair logic invoked in an invalid context: ' + context.now);
+                  // $lab:coverage:on$
+                }
+                break;
+
+              // Comment
+              case internals.components.contextComment:
+                // http://tools.ietf.org/html/rfc5322#section-3.2.2
+                //   comment  = "(" *([FWS] ccontent) [FWS] ")"
+                //
+                //   ccontent = ctext / quoted-pair / comment
+                switch (token) {
+                  // Nested comment
+                  case '(':
+                    // Nested comments are ok
+                    context.stack.push(context.now);
+                    context.now = internals.components.contextComment;
+                    break;
+
+                  // End of comment
+                  case ')':
+                    context.prev = context.now;
+                    context.now = context.stack.pop();
+                    break;
+
+                  // Quoted pair
+                  case '\\':
+                    context.stack.push(context.now);
+                    context.now = internals.components.contextQuotedPair;
+                    break;
+
+                  // Folding white space
+                  case '\r':
+                    if (emailLength === ++i || email[i] !== '\n') {
+                      // Fatal error
+                      updateResult(internals.diagnoses.errCRNoLF);
+                      break;
+                    }
+
+                  // Fallthrough
+
+                  case ' ':
+                  case '\t':
+                    updateResult(internals.diagnoses.cfwsFWS);
+
+                    context.stack.push(context.now);
+                    context.now = internals.components.contextFWS;
+                    prevToken = token;
+                    break;
+
+                  // CTEXT
+                  default:
+                    // http://tools.ietf.org/html/rfc5322#section-3.2.3
+                    //   ctext         = %d33-39 /  ; Printable US-ASCII
+                    //                   %d42-91 /  ;  characters not including
+                    //                   %d93-126 / ;  "(", ")", or "\"
+                    //                   obs-ctext
+                    //
+                    //   obs-ctext     = obs-NO-WS-CTL
+                    //
+                    //   obs-NO-WS-CTL = %d1-8 /    ; US-ASCII control
+                    //                   %d11 /     ;  characters that do not
+                    //                   %d12 /     ;  include the carriage
+                    //                   %d14-31 /  ;  return, line feed, and
+                    //                   %d127      ;  white space characters
+                    charCode = token.codePointAt(0);
+
+                    if (charCode === 0 || charCode === 10 || charCode !== 127 && internals.c1Controls(charCode)) {
+                      // Fatal error
+                      updateResult(internals.diagnoses.errExpectingCTEXT);
+                      break;
+                    } else if (internals.c0Controls(charCode) || charCode === 127) {
+                      updateResult(internals.diagnoses.deprecatedCTEXT);
+                    }
+                }
+
+                break;
+
+              // Folding white space
+              case internals.components.contextFWS:
+                // http://tools.ietf.org/html/rfc5322#section-3.2.2
+                //   FWS     =   ([*WSP CRLF] 1*WSP) /  obs-FWS
+                //                                   ; Folding white space
+
+                // But note the erratum:
+                // http://www.rfc-editor.org/errata_search.php?rfc=5322&eid=1908:
+                //   In the obsolete syntax, any amount of folding white space MAY be
+                //   inserted where the obs-FWS rule is allowed.  This creates the
+                //   possibility of having two consecutive "folds" in a line, and
+                //   therefore the possibility that a line which makes up a folded header
+                //   field could be composed entirely of white space.
+                //
+                //   obs-FWS =   1*([CRLF] WSP)
+
+                if (prevToken === '\r') {
+                  if (token === '\r') {
+                    // Fatal error
+                    updateResult(internals.diagnoses.errFWSCRLFx2);
+                    break;
+                  }
+
+                  if (++crlfCount > 1) {
+                    // Multiple folds => obsolete FWS
+                    updateResult(internals.diagnoses.deprecatedFWS);
+                  } else {
+                    crlfCount = 1;
+                  }
+                }
+
+                switch (token) {
+                  case '\r':
+                    if (emailLength === ++i || email[i] !== '\n') {
+                      // Fatal error
+                      updateResult(internals.diagnoses.errCRNoLF);
+                    }
+
+                    break;
+
+                  case ' ':
+                  case '\t':
+                    break;
+
+                  default:
+                    if (prevToken === '\r') {
+                      // Fatal error
+                      updateResult(internals.diagnoses.errFWSCRLFEnd);
+                    }
+
+                    crlfCount = 0;
+
+                    // End of FWS
+                    context.prev = context.now;
+                    context.now = context.stack.pop();
+
+                    // Look at this token again in the parent context
+                    --i;
+                }
+
+                prevToken = token;
+                break;
+
+              // Unexpected context
+              // $lab:coverage:off$
+              default:
+                throw new Error('unknown context: ' + context.now);
+              // $lab:coverage:on$
+            } // Primary state machine
+
+            if (maxResult > internals.categories.rfc5322) {
+              // Fatal error, no point continuing
+              break;
+            }
+          } // Token loop
+
+          // Check for errors
+          if (maxResult < internals.categories.rfc5322) {
+            var _punycodeLength = Punycode.encode(parseData.domain).length;
+            // Fatal errors
+            if (context.now === internals.components.contextQuotedString) {
+              updateResult(internals.diagnoses.errUnclosedQuotedString);
+            } else if (context.now === internals.components.contextQuotedPair) {
+              updateResult(internals.diagnoses.errBackslashEnd);
+            } else if (context.now === internals.components.contextComment) {
+              updateResult(internals.diagnoses.errUnclosedComment);
+            } else if (context.now === internals.components.literal) {
+              updateResult(internals.diagnoses.errUnclosedDomainLiteral);
+            } else if (token === '\r') {
+              updateResult(internals.diagnoses.errFWSCRLFEnd);
+            } else if (parseData.domain.length === 0) {
+              updateResult(internals.diagnoses.errNoDomain);
+            } else if (elementLength === 0) {
+              updateResult(internals.diagnoses.errDotEnd);
+            } else if (hyphenFlag) {
+              updateResult(internals.diagnoses.errDomainHyphenEnd);
+            }
+
+            // Other errors
+            else if (_punycodeLength > 255) {
+                // http://tools.ietf.org/html/rfc5321#section-4.5.3.1.2
+                //   The maximum total length of a domain name or number is 255 octets.
+                updateResult(internals.diagnoses.rfc5322DomainTooLong);
+              } else if (Buffer.byteLength(parseData.local, 'utf8') + _punycodeLength + /* '@' */1 > 254) {
+                // http://tools.ietf.org/html/rfc5321#section-4.1.2
+                //   Forward-path   = Path
+                //
+                //   Path           = "<" [ A-d-l ":" ] Mailbox ">"
+                //
+                // http://tools.ietf.org/html/rfc5321#section-4.5.3.1.3
+                //   The maximum total length of a reverse-path or forward-path is 256 octets (including the punctuation and element separators).
+                //
+                // Thus, even without (obsolete) routing information, the Mailbox can only be 254 characters long. This is confirmed by this verified
+                // erratum to RFC 3696:
+                //
+                // http://www.rfc-editor.org/errata_search.php?rfc=3696&eid=1690
+                //   However, there is a restriction in RFC 2821 on the length of an address in MAIL and RCPT commands of 254 characters.  Since
+                //   addresses that do not fit in those fields are not normally useful, the upper limit on address lengths should normally be considered
+                //   to be 254.
+                updateResult(internals.diagnoses.rfc5322TooLong);
+              } else if (elementLength > 63) {
+                // http://tools.ietf.org/html/rfc1035#section-2.3.4
+                // labels   63 octets or less
+                updateResult(internals.diagnoses.rfc5322LabelTooLong);
+              } else if (options.minDomainAtoms && atomData.domains.length < options.minDomainAtoms) {
+                updateResult(internals.diagnoses.errDomainTooShort);
+              } else if (options.tldWhitelist || options.tldBlacklist) {
+                var tldAtom = atomData.domains[elementCount];
+
+                if (!internals.validDomain(tldAtom, options)) {
+                  updateResult(internals.diagnoses.errUnknownTLD);
+                }
+              }
+          } // Check for errors
+
+          // Finish
+          if (maxResult < internals.categories.dnsWarn) {
+            // Per RFC 5321, domain atoms are limited to letter-digit-hyphen, so we only need to check code <= 57 to check for a digit
+            var code = atomData.domains[elementCount].codePointAt(0);
+
+            if (code <= 57) {
+              updateResult(internals.diagnoses.rfc5321TLDNumeric);
+            }
+          }
+
+          if (maxResult < threshold) {
+            maxResult = internals.diagnoses.valid;
+          }
+
+          var finishResult = diagnose ? maxResult : maxResult < internals.defaultThreshold;
+
+          if (callback) {
+            callback(finishResult);
+          }
+
+          return finishResult;
+        };
+
+        exports.diagnoses = internals.validate.diagnoses = function () {
+
+          var diag = {};
+          var keys = Object.keys(internals.diagnoses);
+          for (var i = 0; i < keys.length; ++i) {
+            var key = keys[i];
+            diag[key] = internals.diagnoses[key];
+          }
+
+          return diag;
+        }();
+
+        exports.normalize = internals.normalize = function (email) {
+
+          // $lab:coverage:off$
+          if (process.version[1] === '4' && email.indexOf("\0") >= 0) {
+            return internals.nulNormalize(email);
+          }
+          // $lab:coverage:on$
+
+
+          return email.normalize('NFC');
+        };
+      }).call(this, require('_process'), require("buffer").Buffer);
+    }, { "_process": 150, "buffer": 76, "punycode": 157 }], 2: [function (require, module, exports) {
       'use strict';
 
       // Load modules
@@ -614,7 +1907,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return safe;
         }();
       }).call(this, require("buffer").Buffer);
-    }, { "buffer": 77 }], 5: [function (require, module, exports) {
+    }, { "buffer": 76 }], 5: [function (require, module, exports) {
       (function (process, Buffer) {
         'use strict';
 
@@ -1501,7 +2794,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return new Promise(exports.ignore);
         };
       }).call(this, require('_process'), require("buffer").Buffer);
-    }, { "./escape": 4, "_process": 151, "buffer": 77, "crypto": 86, "path": 144, "util": 188 }], 6: [function (require, module, exports) {
+    }, { "./escape": 4, "_process": 150, "buffer": 76, "crypto": 85, "path": 143, "util": 187 }], 6: [function (require, module, exports) {
       'use strict';
 
       // Load modules
@@ -1945,7 +3238,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       };
 
       module.exports = internals.root();
-    }, { "../package.json": 29, "./cast": 2, "./errors": 3, "./helper/hoek": 5, "./ref": 8, "./types/alternatives": 11, "./types/any": 12, "./types/array": 13, "./types/binary": 14, "./types/boolean": 15, "./types/date": 16, "./types/func": 17, "./types/lazy": 18, "./types/number": 19, "./types/object": 20, "./types/string": 21 }], 7: [function (require, module, exports) {
+    }, { "../package.json": 25, "./cast": 2, "./errors": 3, "./helper/hoek": 5, "./ref": 8, "./types/alternatives": 11, "./types/any": 12, "./types/array": 13, "./types/binary": 14, "./types/boolean": 15, "./types/date": 16, "./types/func": 17, "./types/lazy": 18, "./types/number": 19, "./types/object": 20, "./types/string": 21 }], 7: [function (require, module, exports) {
       'use strict';
 
       // Load modules
@@ -2174,7 +3467,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         strip: Joi.boolean(),
         noDefaults: Joi.boolean()
       }).strict();
-    }, { "../": 1 }], 10: [function (require, module, exports) {
+    }, { "../": 6 }], 10: [function (require, module, exports) {
       (function (Buffer) {
         'use strict';
 
@@ -2299,8 +3592,8 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
           return Set;
         }();
-      }).call(this, { "isBuffer": require("../../../../../../../usr/local/lib/node_modules/browserify/node_modules/is-buffer/index.js") });
-    }, { "../../../../../../../usr/local/lib/node_modules/browserify/node_modules/is-buffer/index.js": 132, "./ref": 8 }], 11: [function (require, module, exports) {
+      }).call(this, { "isBuffer": require("../../../../../../../../../usr/local/lib/node_modules/browserify/node_modules/is-buffer/index.js") });
+    }, { "../../../../../../../../../usr/local/lib/node_modules/browserify/node_modules/is-buffer/index.js": 131, "./ref": 8 }], 11: [function (require, module, exports) {
       'use strict';
 
       // Load modules
@@ -4148,7 +5441,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         module.exports = new internals.Binary();
       }).call(this, require("buffer").Buffer);
-    }, { "../../helper/hoek": 5, "../any": 12, "buffer": 77 }], 15: [function (require, module, exports) {
+    }, { "../../helper/hoek": 5, "../any": 12, "buffer": 76 }], 15: [function (require, module, exports) {
       'use strict';
 
       // Load modules
@@ -5664,7 +6957,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       };
 
       module.exports = new internals.Object();
-    }, { "../../cast": 2, "../../errors": 3, "../../helper/hoek": 5, "../any": 12, "topo": 28 }], 21: [function (require, module, exports) {
+    }, { "../../cast": 2, "../../errors": 3, "../../helper/hoek": 5, "../any": 12, "topo": 26 }], 21: [function (require, module, exports) {
       (function (Buffer) {
         'use strict';
 
@@ -6295,7 +7588,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         module.exports = new internals.String();
       }).call(this, require("buffer").Buffer);
-    }, { "../../helper/hoek": 5, "../../ref": 8, "../any": 12, "../date": 16, "./ip": 22, "./uri": 24, "buffer": 77, "isemail": 27, "net": 30 }], 22: [function (require, module, exports) {
+    }, { "../../helper/hoek": 5, "../../ref": 8, "../any": 12, "../date": 16, "./ip": 22, "./uri": 24, "buffer": 76, "isemail": 1, "net": 29 }], 22: [function (require, module, exports) {
       'use strict';
 
       // Load modules
@@ -6600,8 +7893,263 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
       module.exports = internals.Uri;
     }, { "./rfc3986": 23 }], 25: [function (require, module, exports) {
+      module.exports = {
+        "name": "joi",
+        "description": "Object schema validation",
+        "version": "11.3.4",
+        "homepage": "https://github.com/hapijs/joi",
+        "repository": "git://github.com/hapijs/joi",
+        "main": "lib/index.js",
+        "keywords": ["hapi", "schema", "validation"],
+        "engines": {
+          "node": ">=4.0.0"
+        },
+        "dependencies": {
+          "hoek": "4.x.x",
+          "isemail": "3.x.x",
+          "topo": "2.x.x"
+        },
+        "devDependencies": {
+          "hapitoc": "1.x.x",
+          "lab": "14.x.x"
+        },
+        "scripts": {
+          "test": "lab -t 100 -a code -L",
+          "test-debug": "lab -a code",
+          "test-cov-html": "lab -r html -o coverage.html -a code",
+          "toc": "hapitoc",
+          "version": "npm run toc && git add API.md README.md"
+        },
+        "license": "BSD-3-Clause"
+      };
+    }, {}], 26: [function (require, module, exports) {
+      'use strict';
+
+      // Load modules
+
+      var Hoek = require('hoek');
+
+      // Declare internals
+
+      var internals = {};
+
+      exports = module.exports = internals.Topo = function () {
+
+        this._items = [];
+        this.nodes = [];
+      };
+
+      internals.Topo.prototype.add = function (nodes, options) {
+        var _this20 = this;
+
+        options = options || {};
+
+        // Validate rules
+
+        var before = [].concat(options.before || []);
+        var after = [].concat(options.after || []);
+        var group = options.group || '?';
+        var sort = options.sort || 0; // Used for merging only
+
+        Hoek.assert(before.indexOf(group) === -1, 'Item cannot come before itself:', group);
+        Hoek.assert(before.indexOf('?') === -1, 'Item cannot come before unassociated items');
+        Hoek.assert(after.indexOf(group) === -1, 'Item cannot come after itself:', group);
+        Hoek.assert(after.indexOf('?') === -1, 'Item cannot come after unassociated items');
+
+        [].concat(nodes).forEach(function (node, i) {
+
+          var item = {
+            seq: _this20._items.length,
+            sort: sort,
+            before: before,
+            after: after,
+            group: group,
+            node: node
+          };
+
+          _this20._items.push(item);
+        });
+
+        // Insert event
+
+        var error = this._sort();
+        Hoek.assert(!error, 'item', group !== '?' ? 'added into group ' + group : '', 'created a dependencies error');
+
+        return this.nodes;
+      };
+
+      internals.Topo.prototype.merge = function (others) {
+
+        others = [].concat(others);
+        for (var i = 0; i < others.length; ++i) {
+          var other = others[i];
+          if (other) {
+            for (var j = 0; j < other._items.length; ++j) {
+              var item = Hoek.shallow(other._items[j]);
+              this._items.push(item);
+            }
+          }
+        }
+
+        // Sort items
+
+        this._items.sort(internals.mergeSort);
+        for (var _i27 = 0; _i27 < this._items.length; ++_i27) {
+          this._items[_i27].seq = _i27;
+        }
+
+        var error = this._sort();
+        Hoek.assert(!error, 'merge created a dependencies error');
+
+        return this.nodes;
+      };
+
+      internals.mergeSort = function (a, b) {
+
+        return a.sort === b.sort ? 0 : a.sort < b.sort ? -1 : 1;
+      };
+
+      internals.Topo.prototype._sort = function () {
+
+        // Construct graph
+
+        var graph = {};
+        var graphAfters = Object.create(null); // A prototype can bungle lookups w/ false positives
+        var groups = Object.create(null);
+
+        for (var i = 0; i < this._items.length; ++i) {
+          var item = this._items[i];
+          var seq = item.seq; // Unique across all items
+          var group = item.group;
+
+          // Determine Groups
+
+          groups[group] = groups[group] || [];
+          groups[group].push(seq);
+
+          // Build intermediary graph using 'before'
+
+          graph[seq] = item.before;
+
+          // Build second intermediary graph with 'after'
+
+          var after = item.after;
+          for (var j = 0; j < after.length; ++j) {
+            graphAfters[after[j]] = (graphAfters[after[j]] || []).concat(seq);
+          }
+        }
+
+        // Expand intermediary graph
+
+        var graphNodes = Object.keys(graph);
+        for (var _i28 = 0; _i28 < graphNodes.length; ++_i28) {
+          var node = graphNodes[_i28];
+          var expandedGroups = [];
+
+          var graphNodeItems = Object.keys(graph[node]);
+          for (var _j6 = 0; _j6 < graphNodeItems.length; ++_j6) {
+            var _group = graph[node][graphNodeItems[_j6]];
+            groups[_group] = groups[_group] || [];
+
+            for (var k = 0; k < groups[_group].length; ++k) {
+              expandedGroups.push(groups[_group][k]);
+            }
+          }
+          graph[node] = expandedGroups;
+        }
+
+        // Merge intermediary graph using graphAfters into final graph
+
+        var afterNodes = Object.keys(graphAfters);
+        for (var _i29 = 0; _i29 < afterNodes.length; ++_i29) {
+          var _group2 = afterNodes[_i29];
+
+          if (groups[_group2]) {
+            for (var _j7 = 0; _j7 < groups[_group2].length; ++_j7) {
+              var _node = groups[_group2][_j7];
+              graph[_node] = graph[_node].concat(graphAfters[_group2]);
+            }
+          }
+        }
+
+        // Compile ancestors
+
+        var children = void 0;
+        var ancestors = {};
+        graphNodes = Object.keys(graph);
+        for (var _i30 = 0; _i30 < graphNodes.length; ++_i30) {
+          var _node2 = graphNodes[_i30];
+          children = graph[_node2];
+
+          for (var _j8 = 0; _j8 < children.length; ++_j8) {
+            ancestors[children[_j8]] = (ancestors[children[_j8]] || []).concat(_node2);
+          }
+        }
+
+        // Topo sort
+
+        var visited = {};
+        var sorted = [];
+
+        for (var _i31 = 0; _i31 < this._items.length; ++_i31) {
+          var next = _i31;
+
+          if (ancestors[_i31]) {
+            next = null;
+            for (var _j9 = 0; _j9 < this._items.length; ++_j9) {
+              if (visited[_j9] === true) {
+                continue;
+              }
+
+              if (!ancestors[_j9]) {
+                ancestors[_j9] = [];
+              }
+
+              var shouldSeeCount = ancestors[_j9].length;
+              var seenCount = 0;
+              for (var _k = 0; _k < shouldSeeCount; ++_k) {
+                if (sorted.indexOf(ancestors[_j9][_k]) >= 0) {
+                  ++seenCount;
+                }
+              }
+
+              if (seenCount === shouldSeeCount) {
+                next = _j9;
+                break;
+              }
+            }
+          }
+
+          if (next !== null) {
+            next = next.toString(); // Normalize to string TODO: replace with seq
+            visited[next] = true;
+            sorted.push(next);
+          }
+        }
+
+        if (sorted.length !== this._items.length) {
+          return new Error('Invalid dependencies');
+        }
+
+        var seqIndex = {};
+        for (var _i32 = 0; _i32 < this._items.length; ++_i32) {
+          var _item2 = this._items[_i32];
+          seqIndex[_item2.seq] = _item2;
+        }
+
+        var sortedNodes = [];
+        this._items = sorted.map(function (value) {
+
+          var sortedItem = seqIndex[value];
+          sortedNodes.push(sortedItem.node);
+          return sortedItem;
+        });
+
+        this.nodes = sortedNodes;
+      };
+    }, { "hoek": 28 }], 27: [function (require, module, exports) {
       arguments[4][4][0].apply(exports, arguments);
-    }, { "buffer": 77, "dup": 4 }], 26: [function (require, module, exports) {
+    }, { "buffer": 76, "dup": 4 }], 28: [function (require, module, exports) {
       (function (process, Buffer) {
         'use strict';
 
@@ -6704,8 +8252,8 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           }
 
           var keys = Object.keys(source);
-          for (var _i27 = 0; _i27 < keys.length; ++_i27) {
-            var key = keys[_i27];
+          for (var _i33 = 0; _i33 < keys.length; ++_i33) {
+            var key = keys[_i33];
             var value = source[key];
             if (value && (typeof value === "undefined" ? "undefined" : _typeof(value)) === 'object') {
 
@@ -6900,8 +8448,8 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
               return false;
             }
 
-            for (var _i28 = 0; _i28 < obj.length; ++_i28) {
-              if (obj[_i28] !== ref[_i28]) {
+            for (var _i34 = 0; _i34 < obj.length; ++_i34) {
+              if (obj[_i34] !== ref[_i34]) {
                 return false;
               }
             }
@@ -6929,8 +8477,8 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
             return false;
           }
 
-          for (var _i29 = 0; _i29 < keys.length; ++_i29) {
-            var key = keys[_i29];
+          for (var _i35 = 0; _i35 < keys.length; ++_i35) {
+            var key = keys[_i35];
             var descriptor = Object.getOwnPropertyDescriptor(obj, key);
             if (descriptor.get) {
               if (!exports.deepEqual(descriptor, Object.getOwnPropertyDescriptor(ref, key), options, seen)) {
@@ -7066,10 +8614,10 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
           if (typeof ref === 'string') {
             var pattern = '(';
-            for (var _i30 = 0; _i30 < values.length; ++_i30) {
-              var value = values[_i30];
+            for (var _i36 = 0; _i36 < values.length; ++_i36) {
+              var value = values[_i36];
               exports.assert(typeof value === 'string', 'Cannot compare string reference to non-string value');
-              pattern += (_i30 ? '|' : '') + exports.escapeRegex(value);
+              pattern += (_i36 ? '|' : '') + exports.escapeRegex(value);
             }
 
             var regex = new RegExp(pattern + ')', 'g');
@@ -7082,10 +8630,10 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
             misses = !!leftovers;
           } else if (Array.isArray(ref)) {
-            for (var _i31 = 0; _i31 < ref.length; ++_i31) {
+            for (var _i37 = 0; _i37 < ref.length; ++_i37) {
               var matched = false;
               for (var j = 0; j < values.length && matched === false; ++j) {
-                matched = compare(values[j], ref[_i31], compareFlags) && j;
+                matched = compare(values[j], ref[_i37], compareFlags) && j;
               }
 
               if (matched !== false) {
@@ -7096,8 +8644,8 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
             }
           } else {
             var keys = Object.getOwnPropertyNames(ref);
-            for (var _i32 = 0; _i32 < keys.length; ++_i32) {
-              var key = keys[_i32];
+            for (var _i38 = 0; _i38 < keys.length; ++_i38) {
+              var key = keys[_i38];
               var pos = values.indexOf(key);
               if (pos !== -1) {
                 if (valuePairs && !compare(valuePairs[key], ref[key], compareFlags)) {
@@ -7113,9 +8661,9 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           }
 
           var result = false;
-          for (var _i33 = 0; _i33 < matches.length; ++_i33) {
-            result = result || !!matches[_i33];
-            if (options.once && matches[_i33] > 1 || !options.part && !matches[_i33]) {
+          for (var _i39 = 0; _i39 < matches.length; ++_i39) {
+            result = result || !!matches[_i39];
+            if (options.once && matches[_i39] > 1 || !options.part && !matches[_i39]) {
 
               return false;
             }
@@ -7440,8 +8988,8 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           var result = {};
           var keys = Object.keys(transform);
 
-          for (var _i34 = 0; _i34 < keys.length; ++_i34) {
-            var key = keys[_i34];
+          for (var _i40 = 0; _i40 < keys.length; ++_i40) {
+            var key = keys[_i40];
             var path = key.split(separator);
             var sourcePath = transform[key];
 
@@ -7498,1561 +9046,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return target;
         };
       }).call(this, require('_process'), require("buffer").Buffer);
-    }, { "./escape": 25, "_process": 151, "buffer": 77, "crypto": 86, "path": 144, "util": 188 }], 27: [function (require, module, exports) {
-      (function (process, Buffer) {
-        'use strict';
-
-        // Load modules
-
-        var Punycode = require('punycode');
-
-        // Declare internals
-
-        var internals = {
-          hasOwn: Object.prototype.hasOwnProperty,
-          indexOf: Array.prototype.indexOf,
-          defaultThreshold: 16,
-          maxIPv6Groups: 8,
-
-          categories: {
-            valid: 1,
-            dnsWarn: 7,
-            rfc5321: 15,
-            cfws: 31,
-            deprecated: 63,
-            rfc5322: 127,
-            error: 255
-          },
-
-          diagnoses: {
-
-            // Address is valid
-
-            valid: 0,
-
-            // Address is valid for SMTP but has unusual elements
-
-            rfc5321TLD: 9,
-            rfc5321TLDNumeric: 10,
-            rfc5321QuotedString: 11,
-            rfc5321AddressLiteral: 12,
-
-            // Address is valid for message, but must be modified for envelope
-
-            cfwsComment: 17,
-            cfwsFWS: 18,
-
-            // Address contains deprecated elements, but may still be valid in some contexts
-
-            deprecatedLocalPart: 33,
-            deprecatedFWS: 34,
-            deprecatedQTEXT: 35,
-            deprecatedQP: 36,
-            deprecatedComment: 37,
-            deprecatedCTEXT: 38,
-            deprecatedIPv6: 39,
-            deprecatedCFWSNearAt: 49,
-
-            // Address is only valid according to broad definition in RFC 5322, but is otherwise invalid
-
-            rfc5322Domain: 65,
-            rfc5322TooLong: 66,
-            rfc5322LocalTooLong: 67,
-            rfc5322DomainTooLong: 68,
-            rfc5322LabelTooLong: 69,
-            rfc5322DomainLiteral: 70,
-            rfc5322DomainLiteralOBSDText: 71,
-            rfc5322IPv6GroupCount: 72,
-            rfc5322IPv62x2xColon: 73,
-            rfc5322IPv6BadCharacter: 74,
-            rfc5322IPv6MaxGroups: 75,
-            rfc5322IPv6ColonStart: 76,
-            rfc5322IPv6ColonEnd: 77,
-
-            // Address is invalid for any purpose
-
-            errExpectingDTEXT: 129,
-            errNoLocalPart: 130,
-            errNoDomain: 131,
-            errConsecutiveDots: 132,
-            errATEXTAfterCFWS: 133,
-            errATEXTAfterQS: 134,
-            errATEXTAfterDomainLiteral: 135,
-            errExpectingQPair: 136,
-            errExpectingATEXT: 137,
-            errExpectingQTEXT: 138,
-            errExpectingCTEXT: 139,
-            errBackslashEnd: 140,
-            errDotStart: 141,
-            errDotEnd: 142,
-            errDomainHyphenStart: 143,
-            errDomainHyphenEnd: 144,
-            errUnclosedQuotedString: 145,
-            errUnclosedComment: 146,
-            errUnclosedDomainLiteral: 147,
-            errFWSCRLFx2: 148,
-            errFWSCRLFEnd: 149,
-            errCRNoLF: 150,
-            errUnknownTLD: 160,
-            errDomainTooShort: 161
-          },
-
-          components: {
-            localpart: 0,
-            domain: 1,
-            literal: 2,
-            contextComment: 3,
-            contextFWS: 4,
-            contextQuotedString: 5,
-            contextQuotedPair: 6
-          }
-        };
-
-        internals.specials = function () {
-
-          var specials = '()<>[]:;@\\,."'; // US-ASCII visible characters not valid for atext (http://tools.ietf.org/html/rfc5322#section-3.2.3)
-          var lookup = new Array(0x100);
-          lookup.fill(false);
-
-          for (var i = 0; i < specials.length; ++i) {
-            lookup[specials.codePointAt(i)] = true;
-          }
-
-          return function (code) {
-
-            return lookup[code];
-          };
-        }();
-
-        internals.c0Controls = function () {
-
-          var lookup = new Array(0x100);
-          lookup.fill(false);
-
-          // add C0 control characters
-
-          for (var i = 0; i < 33; ++i) {
-            lookup[i] = true;
-          }
-
-          return function (code) {
-
-            return lookup[code];
-          };
-        }();
-
-        internals.c1Controls = function () {
-
-          var lookup = new Array(0x100);
-          lookup.fill(false);
-
-          // add C1 control characters
-
-          for (var i = 127; i < 160; ++i) {
-            lookup[i] = true;
-          }
-
-          return function (code) {
-
-            return lookup[code];
-          };
-        }();
-
-        internals.regex = {
-          ipV4: /\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)$/,
-          ipV6: /^[a-fA-F\d]{0,4}$/
-        };
-
-        // $lab:coverage:off$
-        internals.nulNormalize = function (email) {
-
-          var emailPieces = email.split("\0");
-          emailPieces = emailPieces.map(function (string) {
-
-            return string.normalize('NFC');
-          });
-
-          return emailPieces.join("\0");
-        };
-        // $lab:coverage:on$
-
-
-        internals.checkIpV6 = function (items) {
-
-          return items.every(function (value) {
-            return internals.regex.ipV6.test(value);
-          });
-        };
-
-        internals.validDomain = function (tldAtom, options) {
-
-          if (options.tldBlacklist) {
-            if (Array.isArray(options.tldBlacklist)) {
-              return internals.indexOf.call(options.tldBlacklist, tldAtom) === -1;
-            }
-
-            return !internals.hasOwn.call(options.tldBlacklist, tldAtom);
-          }
-
-          if (Array.isArray(options.tldWhitelist)) {
-            return internals.indexOf.call(options.tldWhitelist, tldAtom) !== -1;
-          }
-
-          return internals.hasOwn.call(options.tldWhitelist, tldAtom);
-        };
-
-        /**
-         * Check that an email address conforms to RFCs 5321, 5322, 6530 and others
-         *
-         * We distinguish clearly between a Mailbox as defined by RFC 5321 and an
-         * addr-spec as defined by RFC 5322. Depending on the context, either can be
-         * regarded as a valid email address. The RFC 5321 Mailbox specification is
-         * more restrictive (comments, white space and obsolete forms are not allowed).
-         *
-         * @param {string} email The email address to check. See README for specifics.
-         * @param {Object} options The (optional) options:
-         *   {*} errorLevel Determines the boundary between valid and invalid
-         *     addresses.
-         *   {*} tldBlacklist The set of domains to consider invalid.
-         *   {*} tldWhitelist The set of domains to consider valid.
-         *   {*} minDomainAtoms The minimum number of domain atoms which must be present
-         *     for the address to be valid.
-         * @param {function(number|boolean)} callback The (optional) callback handler.
-         * @return {*}
-         */
-
-        exports.validate = internals.validate = function (email, options, callback) {
-
-          options = options || {};
-          email = internals.normalize(email);
-
-          if (typeof options === 'function') {
-            callback = options;
-            options = {};
-          }
-
-          if (typeof callback !== 'function') {
-            callback = null;
-          }
-
-          var diagnose = void 0;
-          var threshold = void 0;
-
-          if (typeof options.errorLevel === 'number') {
-            diagnose = true;
-            threshold = options.errorLevel;
-          } else {
-            diagnose = !!options.errorLevel;
-            threshold = internals.diagnoses.valid;
-          }
-
-          if (options.tldWhitelist) {
-            if (typeof options.tldWhitelist === 'string') {
-              options.tldWhitelist = [options.tldWhitelist];
-            } else if (_typeof(options.tldWhitelist) !== 'object') {
-              throw new TypeError('expected array or object tldWhitelist');
-            }
-          }
-
-          if (options.tldBlacklist) {
-            if (typeof options.tldBlacklist === 'string') {
-              options.tldBlacklist = [options.tldBlacklist];
-            } else if (_typeof(options.tldBlacklist) !== 'object') {
-              throw new TypeError('expected array or object tldBlacklist');
-            }
-          }
-
-          if (options.minDomainAtoms && (options.minDomainAtoms !== (+options.minDomainAtoms | 0) || options.minDomainAtoms < 0)) {
-            throw new TypeError('expected positive integer minDomainAtoms');
-          }
-
-          var maxResult = internals.diagnoses.valid;
-          var updateResult = function updateResult(value) {
-
-            if (value > maxResult) {
-              maxResult = value;
-            }
-          };
-
-          var context = {
-            now: internals.components.localpart,
-            prev: internals.components.localpart,
-            stack: [internals.components.localpart]
-          };
-
-          var prevToken = '';
-
-          var parseData = {
-            local: '',
-            domain: ''
-          };
-          var atomData = {
-            locals: [''],
-            domains: ['']
-          };
-
-          var elementCount = 0;
-          var elementLength = 0;
-          var crlfCount = 0;
-          var charCode = void 0;
-
-          var hyphenFlag = false;
-          var assertEnd = false;
-
-          var emailLength = email.length;
-
-          var token = void 0; // Token is used outside the loop, must declare similarly
-          for (var i = 0; i < emailLength; i += token.length) {
-            // Utilize codepoints to account for Unicode surrogate pairs
-            token = String.fromCodePoint(email.codePointAt(i));
-
-            switch (context.now) {
-              // Local-part
-              case internals.components.localpart:
-                // http://tools.ietf.org/html/rfc5322#section-3.4.1
-                //   local-part      =   dot-atom / quoted-string / obs-local-part
-                //
-                //   dot-atom        =   [CFWS] dot-atom-text [CFWS]
-                //
-                //   dot-atom-text   =   1*atext *("." 1*atext)
-                //
-                //   quoted-string   =   [CFWS]
-                //                       DQUOTE *([FWS] qcontent) [FWS] DQUOTE
-                //                       [CFWS]
-                //
-                //   obs-local-part  =   word *("." word)
-                //
-                //   word            =   atom / quoted-string
-                //
-                //   atom            =   [CFWS] 1*atext [CFWS]
-                switch (token) {
-                  // Comment
-                  case '(':
-                    if (elementLength === 0) {
-                      // Comments are OK at the beginning of an element
-                      updateResult(elementCount === 0 ? internals.diagnoses.cfwsComment : internals.diagnoses.deprecatedComment);
-                    } else {
-                      updateResult(internals.diagnoses.cfwsComment);
-                      // Cannot start a comment in an element, should be end
-                      assertEnd = true;
-                    }
-
-                    context.stack.push(context.now);
-                    context.now = internals.components.contextComment;
-                    break;
-
-                  // Next dot-atom element
-                  case '.':
-                    if (elementLength === 0) {
-                      // Another dot, already?
-                      updateResult(elementCount === 0 ? internals.diagnoses.errDotStart : internals.diagnoses.errConsecutiveDots);
-                    } else {
-                      // The entire local-part can be a quoted string for RFC 5321; if one atom is quoted it's an RFC 5322 obsolete form
-                      if (assertEnd) {
-                        updateResult(internals.diagnoses.deprecatedLocalPart);
-                      }
-
-                      // CFWS & quoted strings are OK again now we're at the beginning of an element (although they are obsolete forms)
-                      assertEnd = false;
-                      elementLength = 0;
-                      ++elementCount;
-                      parseData.local += token;
-                      atomData.locals[elementCount] = '';
-                    }
-
-                    break;
-
-                  // Quoted string
-                  case '"':
-                    if (elementLength === 0) {
-                      // The entire local-part can be a quoted string for RFC 5321; if one atom is quoted it's an RFC 5322 obsolete form
-                      updateResult(elementCount === 0 ? internals.diagnoses.rfc5321QuotedString : internals.diagnoses.deprecatedLocalPart);
-
-                      parseData.local += token;
-                      atomData.locals[elementCount] += token;
-                      elementLength += Buffer.byteLength(token, 'utf8');
-
-                      // Quoted string must be the entire element
-                      assertEnd = true;
-                      context.stack.push(context.now);
-                      context.now = internals.components.contextQuotedString;
-                    } else {
-                      updateResult(internals.diagnoses.errExpectingATEXT);
-                    }
-
-                    break;
-
-                  // Folding white space
-                  case '\r':
-                    if (emailLength === ++i || email[i] !== '\n') {
-                      // Fatal error
-                      updateResult(internals.diagnoses.errCRNoLF);
-                      break;
-                    }
-
-                  // Fallthrough
-
-                  case ' ':
-                  case '\t':
-                    if (elementLength === 0) {
-                      updateResult(elementCount === 0 ? internals.diagnoses.cfwsFWS : internals.diagnoses.deprecatedFWS);
-                    } else {
-                      // We can't start FWS in the middle of an element, better be end
-                      assertEnd = true;
-                    }
-
-                    context.stack.push(context.now);
-                    context.now = internals.components.contextFWS;
-                    prevToken = token;
-                    break;
-
-                  case '@':
-                    // At this point we should have a valid local-part
-                    // $lab:coverage:off$
-                    if (context.stack.length !== 1) {
-                      throw new Error('unexpected item on context stack');
-                    }
-                    // $lab:coverage:on$
-
-                    if (parseData.local.length === 0) {
-                      // Fatal error
-                      updateResult(internals.diagnoses.errNoLocalPart);
-                    } else if (elementLength === 0) {
-                      // Fatal error
-                      updateResult(internals.diagnoses.errDotEnd);
-                    }
-                    // http://tools.ietf.org/html/rfc5321#section-4.5.3.1.1 the maximum total length of a user name or other local-part is 64
-                    //    octets
-                    else if (Buffer.byteLength(parseData.local, 'utf8') > 64) {
-                        updateResult(internals.diagnoses.rfc5322LocalTooLong);
-                      }
-                      // http://tools.ietf.org/html/rfc5322#section-3.4.1 comments and folding white space SHOULD NOT be used around "@" in the
-                      //    addr-spec
-                      //
-                      // http://tools.ietf.org/html/rfc2119
-                      // 4. SHOULD NOT this phrase, or the phrase "NOT RECOMMENDED" mean that there may exist valid reasons in particular
-                      //    circumstances when the particular behavior is acceptable or even useful, but the full implications should be understood
-                      //    and the case carefully weighed before implementing any behavior described with this label.
-                      else if (context.prev === internals.components.contextComment || context.prev === internals.components.contextFWS) {
-                          updateResult(internals.diagnoses.deprecatedCFWSNearAt);
-                        }
-
-                    // Clear everything down for the domain parsing
-                    context.now = internals.components.domain;
-                    context.stack[0] = internals.components.domain;
-                    elementCount = 0;
-                    elementLength = 0;
-                    assertEnd = false; // CFWS can only appear at the end of the element
-                    break;
-
-                  // ATEXT
-                  default:
-                    // http://tools.ietf.org/html/rfc5322#section-3.2.3
-                    //    atext = ALPHA / DIGIT / ; Printable US-ASCII
-                    //            "!" / "#" /     ;  characters not including
-                    //            "$" / "%" /     ;  specials.  Used for atoms.
-                    //            "&" / "'" /
-                    //            "*" / "+" /
-                    //            "-" / "/" /
-                    //            "=" / "?" /
-                    //            "^" / "_" /
-                    //            "`" / "{" /
-                    //            "|" / "}" /
-                    //            "~"
-                    if (assertEnd) {
-                      // We have encountered atext where it is no longer valid
-                      switch (context.prev) {
-                        case internals.components.contextComment:
-                        case internals.components.contextFWS:
-                          updateResult(internals.diagnoses.errATEXTAfterCFWS);
-                          break;
-
-                        case internals.components.contextQuotedString:
-                          updateResult(internals.diagnoses.errATEXTAfterQS);
-                          break;
-
-                        // $lab:coverage:off$
-                        default:
-                          throw new Error('more atext found where none is allowed, but unrecognized prev context: ' + context.prev);
-                        // $lab:coverage:on$
-                      }
-                    } else {
-                      context.prev = context.now;
-                      charCode = token.codePointAt(0);
-
-                      // Especially if charCode == 10
-                      if (internals.specials(charCode) || internals.c0Controls(charCode) || internals.c1Controls(charCode)) {
-
-                        // Fatal error
-                        updateResult(internals.diagnoses.errExpectingATEXT);
-                      }
-
-                      parseData.local += token;
-                      atomData.locals[elementCount] += token;
-                      elementLength += Buffer.byteLength(token, 'utf8');
-                    }
-                }
-
-                break;
-
-              case internals.components.domain:
-                // http://tools.ietf.org/html/rfc5322#section-3.4.1
-                //   domain          =   dot-atom / domain-literal / obs-domain
-                //
-                //   dot-atom        =   [CFWS] dot-atom-text [CFWS]
-                //
-                //   dot-atom-text   =   1*atext *("." 1*atext)
-                //
-                //   domain-literal  =   [CFWS] "[" *([FWS] dtext) [FWS] "]" [CFWS]
-                //
-                //   dtext           =   %d33-90 /          ; Printable US-ASCII
-                //                       %d94-126 /         ;  characters not including
-                //                       obs-dtext          ;  "[", "]", or "\"
-                //
-                //   obs-domain      =   atom *("." atom)
-                //
-                //   atom            =   [CFWS] 1*atext [CFWS]
-
-                // http://tools.ietf.org/html/rfc5321#section-4.1.2
-                //   Mailbox        = Local-part "@" ( Domain / address-literal )
-                //
-                //   Domain         = sub-domain *("." sub-domain)
-                //
-                //   address-literal  = "[" ( IPv4-address-literal /
-                //                    IPv6-address-literal /
-                //                    General-address-literal ) "]"
-                //                    ; See Section 4.1.3
-
-                // http://tools.ietf.org/html/rfc5322#section-3.4.1
-                //      Note: A liberal syntax for the domain portion of addr-spec is
-                //      given here.  However, the domain portion contains addressing
-                //      information specified by and used in other protocols (e.g.,
-                //      [RFC1034], [RFC1035], [RFC1123], [RFC5321]).  It is therefore
-                //      incumbent upon implementations to conform to the syntax of
-                //      addresses for the context in which they are used.
-                //
-                // is_email() author's note: it's not clear how to interpret this in
-                // he context of a general email address validator. The conclusion I
-                // have reached is this: "addressing information" must comply with
-                // RFC 5321 (and in turn RFC 1035), anything that is "semantically
-                // invisible" must comply only with RFC 5322.
-                switch (token) {
-                  // Comment
-                  case '(':
-                    if (elementLength === 0) {
-                      // Comments at the start of the domain are deprecated in the text, comments at the start of a subdomain are obs-domain
-                      // http://tools.ietf.org/html/rfc5322#section-3.4.1
-                      updateResult(elementCount === 0 ? internals.diagnoses.deprecatedCFWSNearAt : internals.diagnoses.deprecatedComment);
-                    } else {
-                      // We can't start a comment mid-element, better be at the end
-                      assertEnd = true;
-                      updateResult(internals.diagnoses.cfwsComment);
-                    }
-
-                    context.stack.push(context.now);
-                    context.now = internals.components.contextComment;
-                    break;
-
-                  // Next dot-atom element
-                  case '.':
-                    var punycodeLength = Punycode.encode(atomData.domains[elementCount]).length;
-                    if (elementLength === 0) {
-                      // Another dot, already? Fatal error.
-                      updateResult(elementCount === 0 ? internals.diagnoses.errDotStart : internals.diagnoses.errConsecutiveDots);
-                    } else if (hyphenFlag) {
-                      // Previous subdomain ended in a hyphen. Fatal error.
-                      updateResult(internals.diagnoses.errDomainHyphenEnd);
-                    } else if (punycodeLength > 63) {
-                      // RFC 5890 specifies that domain labels that are encoded using the Punycode algorithm
-                      // must adhere to the <= 63 octet requirement.
-                      // This includes string prefixes from the Punycode algorithm.
-                      //
-                      // https://tools.ietf.org/html/rfc5890#section-2.3.2.1
-                      // labels          63 octets or less
-
-                      updateResult(internals.diagnoses.rfc5322LabelTooLong);
-                    }
-
-                    // CFWS is OK again now we're at the beginning of an element (although
-                    // it may be obsolete CFWS)
-                    assertEnd = false;
-                    elementLength = 0;
-                    ++elementCount;
-                    atomData.domains[elementCount] = '';
-                    parseData.domain += token;
-
-                    break;
-
-                  // Domain literal
-                  case '[':
-                    if (parseData.domain.length === 0) {
-                      // Domain literal must be the only component
-                      assertEnd = true;
-                      elementLength += Buffer.byteLength(token, 'utf8');
-                      context.stack.push(context.now);
-                      context.now = internals.components.literal;
-                      parseData.domain += token;
-                      atomData.domains[elementCount] += token;
-                      parseData.literal = '';
-                    } else {
-                      // Fatal error
-                      updateResult(internals.diagnoses.errExpectingATEXT);
-                    }
-
-                    break;
-
-                  // Folding white space
-                  case '\r':
-                    if (emailLength === ++i || email[i] !== '\n') {
-                      // Fatal error
-                      updateResult(internals.diagnoses.errCRNoLF);
-                      break;
-                    }
-
-                  // Fallthrough
-
-                  case ' ':
-                  case '\t':
-                    if (elementLength === 0) {
-                      updateResult(elementCount === 0 ? internals.diagnoses.deprecatedCFWSNearAt : internals.diagnoses.deprecatedFWS);
-                    } else {
-                      // We can't start FWS in the middle of an element, so this better be the end
-                      updateResult(internals.diagnoses.cfwsFWS);
-                      assertEnd = true;
-                    }
-
-                    context.stack.push(context.now);
-                    context.now = internals.components.contextFWS;
-                    prevToken = token;
-                    break;
-
-                  // This must be ATEXT
-                  default:
-                    // RFC 5322 allows any atext...
-                    // http://tools.ietf.org/html/rfc5322#section-3.2.3
-                    //    atext = ALPHA / DIGIT / ; Printable US-ASCII
-                    //            "!" / "#" /     ;  characters not including
-                    //            "$" / "%" /     ;  specials.  Used for atoms.
-                    //            "&" / "'" /
-                    //            "*" / "+" /
-                    //            "-" / "/" /
-                    //            "=" / "?" /
-                    //            "^" / "_" /
-                    //            "`" / "{" /
-                    //            "|" / "}" /
-                    //            "~"
-
-                    // But RFC 5321 only allows letter-digit-hyphen to comply with DNS rules
-                    //   (RFCs 1034 & 1123)
-                    // http://tools.ietf.org/html/rfc5321#section-4.1.2
-                    //   sub-domain     = Let-dig [Ldh-str]
-                    //
-                    //   Let-dig        = ALPHA / DIGIT
-                    //
-                    //   Ldh-str        = *( ALPHA / DIGIT / "-" ) Let-dig
-                    //
-                    if (assertEnd) {
-                      // We have encountered ATEXT where it is no longer valid
-                      switch (context.prev) {
-                        case internals.components.contextComment:
-                        case internals.components.contextFWS:
-                          updateResult(internals.diagnoses.errATEXTAfterCFWS);
-                          break;
-
-                        case internals.components.literal:
-                          updateResult(internals.diagnoses.errATEXTAfterDomainLiteral);
-                          break;
-
-                        // $lab:coverage:off$
-                        default:
-                          throw new Error('more atext found where none is allowed, but unrecognized prev context: ' + context.prev);
-                        // $lab:coverage:on$
-                      }
-                    }
-
-                    charCode = token.codePointAt(0);
-                    // Assume this token isn't a hyphen unless we discover it is
-                    hyphenFlag = false;
-
-                    if (internals.specials(charCode) || internals.c0Controls(charCode) || internals.c1Controls(charCode)) {
-                      // Fatal error
-                      updateResult(internals.diagnoses.errExpectingATEXT);
-                    } else if (token === '-') {
-                      if (elementLength === 0) {
-                        // Hyphens cannot be at the beginning of a subdomain, fatal error
-                        updateResult(internals.diagnoses.errDomainHyphenStart);
-                      }
-
-                      hyphenFlag = true;
-                    }
-                    // Check if it's a neither a number nor a latin/unicode letter
-                    else if (charCode < 48 || charCode > 122 && charCode < 192 || charCode > 57 && charCode < 65 || charCode > 90 && charCode < 97) {
-                        // This is not an RFC 5321 subdomain, but still OK by RFC 5322
-                        updateResult(internals.diagnoses.rfc5322Domain);
-                      }
-
-                    parseData.domain += token;
-                    atomData.domains[elementCount] += token;
-                    elementLength += Buffer.byteLength(token, 'utf8');
-                }
-
-                break;
-
-              // Domain literal
-              case internals.components.literal:
-                // http://tools.ietf.org/html/rfc5322#section-3.4.1
-                //   domain-literal  =   [CFWS] "[" *([FWS] dtext) [FWS] "]" [CFWS]
-                //
-                //   dtext           =   %d33-90 /          ; Printable US-ASCII
-                //                       %d94-126 /         ;  characters not including
-                //                       obs-dtext          ;  "[", "]", or "\"
-                //
-                //   obs-dtext       =   obs-NO-WS-CTL / quoted-pair
-                switch (token) {
-                  // End of domain literal
-                  case ']':
-                    if (maxResult < internals.categories.deprecated) {
-                      // Could be a valid RFC 5321 address literal, so let's check
-
-                      // http://tools.ietf.org/html/rfc5321#section-4.1.2
-                      //   address-literal  = "[" ( IPv4-address-literal /
-                      //                    IPv6-address-literal /
-                      //                    General-address-literal ) "]"
-                      //                    ; See Section 4.1.3
-                      //
-                      // http://tools.ietf.org/html/rfc5321#section-4.1.3
-                      //   IPv4-address-literal  = Snum 3("."  Snum)
-                      //
-                      //   IPv6-address-literal  = "IPv6:" IPv6-addr
-                      //
-                      //   General-address-literal  = Standardized-tag ":" 1*dcontent
-                      //
-                      //   Standardized-tag  = Ldh-str
-                      //                     ; Standardized-tag MUST be specified in a
-                      //                     ; Standards-Track RFC and registered with IANA
-                      //
-                      //   dcontent      = %d33-90 / ; Printable US-ASCII
-                      //                 %d94-126 ; excl. "[", "\", "]"
-                      //
-                      //   Snum          = 1*3DIGIT
-                      //                 ; representing a decimal integer
-                      //                 ; value in the range 0 through 255
-                      //
-                      //   IPv6-addr     = IPv6-full / IPv6-comp / IPv6v4-full / IPv6v4-comp
-                      //
-                      //   IPv6-hex      = 1*4HEXDIG
-                      //
-                      //   IPv6-full     = IPv6-hex 7(":" IPv6-hex)
-                      //
-                      //   IPv6-comp     = [IPv6-hex *5(":" IPv6-hex)] "::"
-                      //                 [IPv6-hex *5(":" IPv6-hex)]
-                      //                 ; The "::" represents at least 2 16-bit groups of
-                      //                 ; zeros.  No more than 6 groups in addition to the
-                      //                 ; "::" may be present.
-                      //
-                      //   IPv6v4-full   = IPv6-hex 5(":" IPv6-hex) ":" IPv4-address-literal
-                      //
-                      //   IPv6v4-comp   = [IPv6-hex *3(":" IPv6-hex)] "::"
-                      //                 [IPv6-hex *3(":" IPv6-hex) ":"]
-                      //                 IPv4-address-literal
-                      //                 ; The "::" represents at least 2 16-bit groups of
-                      //                 ; zeros.  No more than 4 groups in addition to the
-                      //                 ; "::" and IPv4-address-literal may be present.
-
-                      var index = -1;
-                      var addressLiteral = parseData.literal;
-                      var matchesIP = internals.regex.ipV4.exec(addressLiteral);
-
-                      // Maybe extract IPv4 part from the end of the address-literal
-                      if (matchesIP) {
-                        index = matchesIP.index;
-                        if (index !== 0) {
-                          // Convert IPv4 part to IPv6 format for futher testing
-                          addressLiteral = addressLiteral.slice(0, index) + '0:0';
-                        }
-                      }
-
-                      if (index === 0) {
-                        // Nothing there except a valid IPv4 address, so...
-                        updateResult(internals.diagnoses.rfc5321AddressLiteral);
-                      } else if (addressLiteral.slice(0, 5).toLowerCase() !== 'ipv6:') {
-                        updateResult(internals.diagnoses.rfc5322DomainLiteral);
-                      } else {
-                        var match = addressLiteral.slice(5);
-                        var maxGroups = internals.maxIPv6Groups;
-                        var groups = match.split(':');
-                        index = match.indexOf('::');
-
-                        if (!~index) {
-                          // Need exactly the right number of groups
-                          if (groups.length !== maxGroups) {
-                            updateResult(internals.diagnoses.rfc5322IPv6GroupCount);
-                          }
-                        } else if (index !== match.lastIndexOf('::')) {
-                          updateResult(internals.diagnoses.rfc5322IPv62x2xColon);
-                        } else {
-                          if (index === 0 || index === match.length - 2) {
-                            // RFC 4291 allows :: at the start or end of an address with 7 other groups in addition
-                            ++maxGroups;
-                          }
-
-                          if (groups.length > maxGroups) {
-                            updateResult(internals.diagnoses.rfc5322IPv6MaxGroups);
-                          } else if (groups.length === maxGroups) {
-                            // Eliding a single "::"
-                            updateResult(internals.diagnoses.deprecatedIPv6);
-                          }
-                        }
-
-                        // IPv6 testing strategy
-                        if (match[0] === ':' && match[1] !== ':') {
-                          updateResult(internals.diagnoses.rfc5322IPv6ColonStart);
-                        } else if (match[match.length - 1] === ':' && match[match.length - 2] !== ':') {
-                          updateResult(internals.diagnoses.rfc5322IPv6ColonEnd);
-                        } else if (internals.checkIpV6(groups)) {
-                          updateResult(internals.diagnoses.rfc5321AddressLiteral);
-                        } else {
-                          updateResult(internals.diagnoses.rfc5322IPv6BadCharacter);
-                        }
-                      }
-                    } else {
-                      updateResult(internals.diagnoses.rfc5322DomainLiteral);
-                    }
-
-                    parseData.domain += token;
-                    atomData.domains[elementCount] += token;
-                    elementLength += Buffer.byteLength(token, 'utf8');
-                    context.prev = context.now;
-                    context.now = context.stack.pop();
-                    break;
-
-                  case '\\':
-                    updateResult(internals.diagnoses.rfc5322DomainLiteralOBSDText);
-                    context.stack.push(context.now);
-                    context.now = internals.components.contextQuotedPair;
-                    break;
-
-                  // Folding white space
-                  case '\r':
-                    if (emailLength === ++i || email[i] !== '\n') {
-                      updateResult(internals.diagnoses.errCRNoLF);
-                      break;
-                    }
-
-                  // Fallthrough
-
-                  case ' ':
-                  case '\t':
-                    updateResult(internals.diagnoses.cfwsFWS);
-
-                    context.stack.push(context.now);
-                    context.now = internals.components.contextFWS;
-                    prevToken = token;
-                    break;
-
-                  // DTEXT
-                  default:
-                    // http://tools.ietf.org/html/rfc5322#section-3.4.1
-                    //   dtext         =   %d33-90 /  ; Printable US-ASCII
-                    //                     %d94-126 / ;  characters not including
-                    //                     obs-dtext  ;  "[", "]", or "\"
-                    //
-                    //   obs-dtext     =   obs-NO-WS-CTL / quoted-pair
-                    //
-                    //   obs-NO-WS-CTL =   %d1-8 /    ; US-ASCII control
-                    //                     %d11 /     ;  characters that do not
-                    //                     %d12 /     ;  include the carriage
-                    //                     %d14-31 /  ;  return, line feed, and
-                    //                     %d127      ;  white space characters
-                    charCode = token.codePointAt(0);
-
-                    // '\r', '\n', ' ', and '\t' have already been parsed above
-                    if (charCode !== 127 && internals.c1Controls(charCode) || charCode === 0 || token === '[') {
-                      // Fatal error
-                      updateResult(internals.diagnoses.errExpectingDTEXT);
-                      break;
-                    } else if (internals.c0Controls(charCode) || charCode === 127) {
-                      updateResult(internals.diagnoses.rfc5322DomainLiteralOBSDText);
-                    }
-
-                    parseData.literal += token;
-                    parseData.domain += token;
-                    atomData.domains[elementCount] += token;
-                    elementLength += Buffer.byteLength(token, 'utf8');
-                }
-
-                break;
-
-              // Quoted string
-              case internals.components.contextQuotedString:
-                // http://tools.ietf.org/html/rfc5322#section-3.2.4
-                //   quoted-string = [CFWS]
-                //                   DQUOTE *([FWS] qcontent) [FWS] DQUOTE
-                //                   [CFWS]
-                //
-                //   qcontent      = qtext / quoted-pair
-                switch (token) {
-                  // Quoted pair
-                  case '\\':
-                    context.stack.push(context.now);
-                    context.now = internals.components.contextQuotedPair;
-                    break;
-
-                  // Folding white space. Spaces are allowed as regular characters inside a quoted string - it's only FWS if we include '\t' or '\r\n'
-                  case '\r':
-                    if (emailLength === ++i || email[i] !== '\n') {
-                      // Fatal error
-                      updateResult(internals.diagnoses.errCRNoLF);
-                      break;
-                    }
-
-                  // Fallthrough
-
-                  case '\t':
-                    // http://tools.ietf.org/html/rfc5322#section-3.2.2
-                    //   Runs of FWS, comment, or CFWS that occur between lexical tokens in
-                    //   a structured header field are semantically interpreted as a single
-                    //   space character.
-
-                    // http://tools.ietf.org/html/rfc5322#section-3.2.4
-                    //   the CRLF in any FWS/CFWS that appears within the quoted-string [is]
-                    //   semantically "invisible" and therefore not part of the
-                    //   quoted-string
-
-                    parseData.local += ' ';
-                    atomData.locals[elementCount] += ' ';
-                    elementLength += Buffer.byteLength(token, 'utf8');
-
-                    updateResult(internals.diagnoses.cfwsFWS);
-                    context.stack.push(context.now);
-                    context.now = internals.components.contextFWS;
-                    prevToken = token;
-                    break;
-
-                  // End of quoted string
-                  case '"':
-                    parseData.local += token;
-                    atomData.locals[elementCount] += token;
-                    elementLength += Buffer.byteLength(token, 'utf8');
-                    context.prev = context.now;
-                    context.now = context.stack.pop();
-                    break;
-
-                  // QTEXT
-                  default:
-                    // http://tools.ietf.org/html/rfc5322#section-3.2.4
-                    //   qtext          =   %d33 /             ; Printable US-ASCII
-                    //                      %d35-91 /          ;  characters not including
-                    //                      %d93-126 /         ;  "\" or the quote character
-                    //                      obs-qtext
-                    //
-                    //   obs-qtext      =   obs-NO-WS-CTL
-                    //
-                    //   obs-NO-WS-CTL  =   %d1-8 /            ; US-ASCII control
-                    //                      %d11 /             ;  characters that do not
-                    //                      %d12 /             ;  include the carriage
-                    //                      %d14-31 /          ;  return, line feed, and
-                    //                      %d127              ;  white space characters
-                    charCode = token.codePointAt(0);
-
-                    if (charCode !== 127 && internals.c1Controls(charCode) || charCode === 0 || charCode === 10) {
-                      updateResult(internals.diagnoses.errExpectingQTEXT);
-                    } else if (internals.c0Controls(charCode) || charCode === 127) {
-                      updateResult(internals.diagnoses.deprecatedQTEXT);
-                    }
-
-                    parseData.local += token;
-                    atomData.locals[elementCount] += token;
-                    elementLength += Buffer.byteLength(token, 'utf8');
-                }
-
-                // http://tools.ietf.org/html/rfc5322#section-3.4.1
-                //   If the string can be represented as a dot-atom (that is, it contains
-                //   no characters other than atext characters or "." surrounded by atext
-                //   characters), then the dot-atom form SHOULD be used and the quoted-
-                //   string form SHOULD NOT be used.
-
-                break;
-              // Quoted pair
-              case internals.components.contextQuotedPair:
-                // http://tools.ietf.org/html/rfc5322#section-3.2.1
-                //   quoted-pair     =   ("\" (VCHAR / WSP)) / obs-qp
-                //
-                //   VCHAR           =  %d33-126   ; visible (printing) characters
-                //   WSP             =  SP / HTAB  ; white space
-                //
-                //   obs-qp          =   "\" (%d0 / obs-NO-WS-CTL / LF / CR)
-                //
-                //   obs-NO-WS-CTL   =   %d1-8 /   ; US-ASCII control
-                //                       %d11 /    ;  characters that do not
-                //                       %d12 /    ;  include the carriage
-                //                       %d14-31 / ;  return, line feed, and
-                //                       %d127     ;  white space characters
-                //
-                // i.e. obs-qp       =  "\" (%d0-8, %d10-31 / %d127)
-                charCode = token.codePointAt(0);
-
-                if (charCode !== 127 && internals.c1Controls(charCode)) {
-                  // Fatal error
-                  updateResult(internals.diagnoses.errExpectingQPair);
-                } else if (charCode < 31 && charCode !== 9 || charCode === 127) {
-                  // ' ' and '\t' are allowed
-                  updateResult(internals.diagnoses.deprecatedQP);
-                }
-
-                // At this point we know where this qpair occurred so we could check to see if the character actually needed to be quoted at all.
-                // http://tools.ietf.org/html/rfc5321#section-4.1.2
-                //   the sending system SHOULD transmit the form that uses the minimum quoting possible.
-
-                context.prev = context.now;
-                // End of qpair
-                context.now = context.stack.pop();
-                var escapeToken = '\\' + token;
-
-                switch (context.now) {
-                  case internals.components.contextComment:
-                    break;
-
-                  case internals.components.contextQuotedString:
-                    parseData.local += escapeToken;
-                    atomData.locals[elementCount] += escapeToken;
-
-                    // The maximum sizes specified by RFC 5321 are octet counts, so we must include the backslash
-                    elementLength += 2;
-                    break;
-
-                  case internals.components.literal:
-                    parseData.domain += escapeToken;
-                    atomData.domains[elementCount] += escapeToken;
-
-                    // The maximum sizes specified by RFC 5321 are octet counts, so we must include the backslash
-                    elementLength += 2;
-                    break;
-
-                  // $lab:coverage:off$
-                  default:
-                    throw new Error('quoted pair logic invoked in an invalid context: ' + context.now);
-                  // $lab:coverage:on$
-                }
-                break;
-
-              // Comment
-              case internals.components.contextComment:
-                // http://tools.ietf.org/html/rfc5322#section-3.2.2
-                //   comment  = "(" *([FWS] ccontent) [FWS] ")"
-                //
-                //   ccontent = ctext / quoted-pair / comment
-                switch (token) {
-                  // Nested comment
-                  case '(':
-                    // Nested comments are ok
-                    context.stack.push(context.now);
-                    context.now = internals.components.contextComment;
-                    break;
-
-                  // End of comment
-                  case ')':
-                    context.prev = context.now;
-                    context.now = context.stack.pop();
-                    break;
-
-                  // Quoted pair
-                  case '\\':
-                    context.stack.push(context.now);
-                    context.now = internals.components.contextQuotedPair;
-                    break;
-
-                  // Folding white space
-                  case '\r':
-                    if (emailLength === ++i || email[i] !== '\n') {
-                      // Fatal error
-                      updateResult(internals.diagnoses.errCRNoLF);
-                      break;
-                    }
-
-                  // Fallthrough
-
-                  case ' ':
-                  case '\t':
-                    updateResult(internals.diagnoses.cfwsFWS);
-
-                    context.stack.push(context.now);
-                    context.now = internals.components.contextFWS;
-                    prevToken = token;
-                    break;
-
-                  // CTEXT
-                  default:
-                    // http://tools.ietf.org/html/rfc5322#section-3.2.3
-                    //   ctext         = %d33-39 /  ; Printable US-ASCII
-                    //                   %d42-91 /  ;  characters not including
-                    //                   %d93-126 / ;  "(", ")", or "\"
-                    //                   obs-ctext
-                    //
-                    //   obs-ctext     = obs-NO-WS-CTL
-                    //
-                    //   obs-NO-WS-CTL = %d1-8 /    ; US-ASCII control
-                    //                   %d11 /     ;  characters that do not
-                    //                   %d12 /     ;  include the carriage
-                    //                   %d14-31 /  ;  return, line feed, and
-                    //                   %d127      ;  white space characters
-                    charCode = token.codePointAt(0);
-
-                    if (charCode === 0 || charCode === 10 || charCode !== 127 && internals.c1Controls(charCode)) {
-                      // Fatal error
-                      updateResult(internals.diagnoses.errExpectingCTEXT);
-                      break;
-                    } else if (internals.c0Controls(charCode) || charCode === 127) {
-                      updateResult(internals.diagnoses.deprecatedCTEXT);
-                    }
-                }
-
-                break;
-
-              // Folding white space
-              case internals.components.contextFWS:
-                // http://tools.ietf.org/html/rfc5322#section-3.2.2
-                //   FWS     =   ([*WSP CRLF] 1*WSP) /  obs-FWS
-                //                                   ; Folding white space
-
-                // But note the erratum:
-                // http://www.rfc-editor.org/errata_search.php?rfc=5322&eid=1908:
-                //   In the obsolete syntax, any amount of folding white space MAY be
-                //   inserted where the obs-FWS rule is allowed.  This creates the
-                //   possibility of having two consecutive "folds" in a line, and
-                //   therefore the possibility that a line which makes up a folded header
-                //   field could be composed entirely of white space.
-                //
-                //   obs-FWS =   1*([CRLF] WSP)
-
-                if (prevToken === '\r') {
-                  if (token === '\r') {
-                    // Fatal error
-                    updateResult(internals.diagnoses.errFWSCRLFx2);
-                    break;
-                  }
-
-                  if (++crlfCount > 1) {
-                    // Multiple folds => obsolete FWS
-                    updateResult(internals.diagnoses.deprecatedFWS);
-                  } else {
-                    crlfCount = 1;
-                  }
-                }
-
-                switch (token) {
-                  case '\r':
-                    if (emailLength === ++i || email[i] !== '\n') {
-                      // Fatal error
-                      updateResult(internals.diagnoses.errCRNoLF);
-                    }
-
-                    break;
-
-                  case ' ':
-                  case '\t':
-                    break;
-
-                  default:
-                    if (prevToken === '\r') {
-                      // Fatal error
-                      updateResult(internals.diagnoses.errFWSCRLFEnd);
-                    }
-
-                    crlfCount = 0;
-
-                    // End of FWS
-                    context.prev = context.now;
-                    context.now = context.stack.pop();
-
-                    // Look at this token again in the parent context
-                    --i;
-                }
-
-                prevToken = token;
-                break;
-
-              // Unexpected context
-              // $lab:coverage:off$
-              default:
-                throw new Error('unknown context: ' + context.now);
-              // $lab:coverage:on$
-            } // Primary state machine
-
-            if (maxResult > internals.categories.rfc5322) {
-              // Fatal error, no point continuing
-              break;
-            }
-          } // Token loop
-
-          // Check for errors
-          if (maxResult < internals.categories.rfc5322) {
-            var _punycodeLength = Punycode.encode(parseData.domain).length;
-            // Fatal errors
-            if (context.now === internals.components.contextQuotedString) {
-              updateResult(internals.diagnoses.errUnclosedQuotedString);
-            } else if (context.now === internals.components.contextQuotedPair) {
-              updateResult(internals.diagnoses.errBackslashEnd);
-            } else if (context.now === internals.components.contextComment) {
-              updateResult(internals.diagnoses.errUnclosedComment);
-            } else if (context.now === internals.components.literal) {
-              updateResult(internals.diagnoses.errUnclosedDomainLiteral);
-            } else if (token === '\r') {
-              updateResult(internals.diagnoses.errFWSCRLFEnd);
-            } else if (parseData.domain.length === 0) {
-              updateResult(internals.diagnoses.errNoDomain);
-            } else if (elementLength === 0) {
-              updateResult(internals.diagnoses.errDotEnd);
-            } else if (hyphenFlag) {
-              updateResult(internals.diagnoses.errDomainHyphenEnd);
-            }
-
-            // Other errors
-            else if (_punycodeLength > 255) {
-                // http://tools.ietf.org/html/rfc5321#section-4.5.3.1.2
-                //   The maximum total length of a domain name or number is 255 octets.
-                updateResult(internals.diagnoses.rfc5322DomainTooLong);
-              } else if (Buffer.byteLength(parseData.local, 'utf8') + _punycodeLength + /* '@' */1 > 254) {
-                // http://tools.ietf.org/html/rfc5321#section-4.1.2
-                //   Forward-path   = Path
-                //
-                //   Path           = "<" [ A-d-l ":" ] Mailbox ">"
-                //
-                // http://tools.ietf.org/html/rfc5321#section-4.5.3.1.3
-                //   The maximum total length of a reverse-path or forward-path is 256 octets (including the punctuation and element separators).
-                //
-                // Thus, even without (obsolete) routing information, the Mailbox can only be 254 characters long. This is confirmed by this verified
-                // erratum to RFC 3696:
-                //
-                // http://www.rfc-editor.org/errata_search.php?rfc=3696&eid=1690
-                //   However, there is a restriction in RFC 2821 on the length of an address in MAIL and RCPT commands of 254 characters.  Since
-                //   addresses that do not fit in those fields are not normally useful, the upper limit on address lengths should normally be considered
-                //   to be 254.
-                updateResult(internals.diagnoses.rfc5322TooLong);
-              } else if (elementLength > 63) {
-                // http://tools.ietf.org/html/rfc1035#section-2.3.4
-                // labels   63 octets or less
-                updateResult(internals.diagnoses.rfc5322LabelTooLong);
-              } else if (options.minDomainAtoms && atomData.domains.length < options.minDomainAtoms) {
-                updateResult(internals.diagnoses.errDomainTooShort);
-              } else if (options.tldWhitelist || options.tldBlacklist) {
-                var tldAtom = atomData.domains[elementCount];
-
-                if (!internals.validDomain(tldAtom, options)) {
-                  updateResult(internals.diagnoses.errUnknownTLD);
-                }
-              }
-          } // Check for errors
-
-          // Finish
-          if (maxResult < internals.categories.dnsWarn) {
-            // Per RFC 5321, domain atoms are limited to letter-digit-hyphen, so we only need to check code <= 57 to check for a digit
-            var code = atomData.domains[elementCount].codePointAt(0);
-
-            if (code <= 57) {
-              updateResult(internals.diagnoses.rfc5321TLDNumeric);
-            }
-          }
-
-          if (maxResult < threshold) {
-            maxResult = internals.diagnoses.valid;
-          }
-
-          var finishResult = diagnose ? maxResult : maxResult < internals.defaultThreshold;
-
-          if (callback) {
-            callback(finishResult);
-          }
-
-          return finishResult;
-        };
-
-        exports.diagnoses = internals.validate.diagnoses = function () {
-
-          var diag = {};
-          var keys = Object.keys(internals.diagnoses);
-          for (var i = 0; i < keys.length; ++i) {
-            var key = keys[i];
-            diag[key] = internals.diagnoses[key];
-          }
-
-          return diag;
-        }();
-
-        exports.normalize = internals.normalize = function (email) {
-
-          // $lab:coverage:off$
-          if (process.version[1] === '4' && email.indexOf("\0") >= 0) {
-            return internals.nulNormalize(email);
-          }
-          // $lab:coverage:on$
-
-
-          return email.normalize('NFC');
-        };
-      }).call(this, require('_process'), require("buffer").Buffer);
-    }, { "_process": 151, "buffer": 77, "punycode": 158 }], 28: [function (require, module, exports) {
-      'use strict';
-
-      // Load modules
-
-      var Hoek = require('hoek');
-
-      // Declare internals
-
-      var internals = {};
-
-      exports = module.exports = internals.Topo = function () {
-
-        this._items = [];
-        this.nodes = [];
-      };
-
-      internals.Topo.prototype.add = function (nodes, options) {
-        var _this20 = this;
-
-        options = options || {};
-
-        // Validate rules
-
-        var before = [].concat(options.before || []);
-        var after = [].concat(options.after || []);
-        var group = options.group || '?';
-        var sort = options.sort || 0; // Used for merging only
-
-        Hoek.assert(before.indexOf(group) === -1, 'Item cannot come before itself:', group);
-        Hoek.assert(before.indexOf('?') === -1, 'Item cannot come before unassociated items');
-        Hoek.assert(after.indexOf(group) === -1, 'Item cannot come after itself:', group);
-        Hoek.assert(after.indexOf('?') === -1, 'Item cannot come after unassociated items');
-
-        [].concat(nodes).forEach(function (node, i) {
-
-          var item = {
-            seq: _this20._items.length,
-            sort: sort,
-            before: before,
-            after: after,
-            group: group,
-            node: node
-          };
-
-          _this20._items.push(item);
-        });
-
-        // Insert event
-
-        var error = this._sort();
-        Hoek.assert(!error, 'item', group !== '?' ? 'added into group ' + group : '', 'created a dependencies error');
-
-        return this.nodes;
-      };
-
-      internals.Topo.prototype.merge = function (others) {
-
-        others = [].concat(others);
-        for (var i = 0; i < others.length; ++i) {
-          var other = others[i];
-          if (other) {
-            for (var j = 0; j < other._items.length; ++j) {
-              var item = Hoek.shallow(other._items[j]);
-              this._items.push(item);
-            }
-          }
-        }
-
-        // Sort items
-
-        this._items.sort(internals.mergeSort);
-        for (var _i35 = 0; _i35 < this._items.length; ++_i35) {
-          this._items[_i35].seq = _i35;
-        }
-
-        var error = this._sort();
-        Hoek.assert(!error, 'merge created a dependencies error');
-
-        return this.nodes;
-      };
-
-      internals.mergeSort = function (a, b) {
-
-        return a.sort === b.sort ? 0 : a.sort < b.sort ? -1 : 1;
-      };
-
-      internals.Topo.prototype._sort = function () {
-
-        // Construct graph
-
-        var graph = {};
-        var graphAfters = Object.create(null); // A prototype can bungle lookups w/ false positives
-        var groups = Object.create(null);
-
-        for (var i = 0; i < this._items.length; ++i) {
-          var item = this._items[i];
-          var seq = item.seq; // Unique across all items
-          var group = item.group;
-
-          // Determine Groups
-
-          groups[group] = groups[group] || [];
-          groups[group].push(seq);
-
-          // Build intermediary graph using 'before'
-
-          graph[seq] = item.before;
-
-          // Build second intermediary graph with 'after'
-
-          var after = item.after;
-          for (var j = 0; j < after.length; ++j) {
-            graphAfters[after[j]] = (graphAfters[after[j]] || []).concat(seq);
-          }
-        }
-
-        // Expand intermediary graph
-
-        var graphNodes = Object.keys(graph);
-        for (var _i36 = 0; _i36 < graphNodes.length; ++_i36) {
-          var node = graphNodes[_i36];
-          var expandedGroups = [];
-
-          var graphNodeItems = Object.keys(graph[node]);
-          for (var _j6 = 0; _j6 < graphNodeItems.length; ++_j6) {
-            var _group = graph[node][graphNodeItems[_j6]];
-            groups[_group] = groups[_group] || [];
-
-            for (var k = 0; k < groups[_group].length; ++k) {
-              expandedGroups.push(groups[_group][k]);
-            }
-          }
-          graph[node] = expandedGroups;
-        }
-
-        // Merge intermediary graph using graphAfters into final graph
-
-        var afterNodes = Object.keys(graphAfters);
-        for (var _i37 = 0; _i37 < afterNodes.length; ++_i37) {
-          var _group2 = afterNodes[_i37];
-
-          if (groups[_group2]) {
-            for (var _j7 = 0; _j7 < groups[_group2].length; ++_j7) {
-              var _node = groups[_group2][_j7];
-              graph[_node] = graph[_node].concat(graphAfters[_group2]);
-            }
-          }
-        }
-
-        // Compile ancestors
-
-        var children = void 0;
-        var ancestors = {};
-        graphNodes = Object.keys(graph);
-        for (var _i38 = 0; _i38 < graphNodes.length; ++_i38) {
-          var _node2 = graphNodes[_i38];
-          children = graph[_node2];
-
-          for (var _j8 = 0; _j8 < children.length; ++_j8) {
-            ancestors[children[_j8]] = (ancestors[children[_j8]] || []).concat(_node2);
-          }
-        }
-
-        // Topo sort
-
-        var visited = {};
-        var sorted = [];
-
-        for (var _i39 = 0; _i39 < this._items.length; ++_i39) {
-          var next = _i39;
-
-          if (ancestors[_i39]) {
-            next = null;
-            for (var _j9 = 0; _j9 < this._items.length; ++_j9) {
-              if (visited[_j9] === true) {
-                continue;
-              }
-
-              if (!ancestors[_j9]) {
-                ancestors[_j9] = [];
-              }
-
-              var shouldSeeCount = ancestors[_j9].length;
-              var seenCount = 0;
-              for (var _k = 0; _k < shouldSeeCount; ++_k) {
-                if (sorted.indexOf(ancestors[_j9][_k]) >= 0) {
-                  ++seenCount;
-                }
-              }
-
-              if (seenCount === shouldSeeCount) {
-                next = _j9;
-                break;
-              }
-            }
-          }
-
-          if (next !== null) {
-            next = next.toString(); // Normalize to string TODO: replace with seq
-            visited[next] = true;
-            sorted.push(next);
-          }
-        }
-
-        if (sorted.length !== this._items.length) {
-          return new Error('Invalid dependencies');
-        }
-
-        var seqIndex = {};
-        for (var _i40 = 0; _i40 < this._items.length; ++_i40) {
-          var _item2 = this._items[_i40];
-          seqIndex[_item2.seq] = _item2;
-        }
-
-        var sortedNodes = [];
-        this._items = sorted.map(function (value) {
-
-          var sortedItem = seqIndex[value];
-          sortedNodes.push(sortedItem.node);
-          return sortedItem;
-        });
-
-        this.nodes = sortedNodes;
-      };
-    }, { "hoek": 26 }], 29: [function (require, module, exports) {
-      module.exports = {
-        "name": "joi",
-        "description": "Object schema validation",
-        "version": "11.3.4",
-        "homepage": "https://github.com/hapijs/joi",
-        "repository": "git://github.com/hapijs/joi",
-        "main": "dist/joi.js",
-        "keywords": ["hapi", "schema", "validation"],
-        "engines": {
-          "node": ">=4.0.0"
-        },
-        "dependencies": {
-          "babel-preset-es2015": "^6.24.1",
-          "hoek": "4.x.x",
-          "isemail": "3.x.x",
-          "topo": "2.x.x"
-        },
-        "devDependencies": {
-          "hapitoc": "1.x.x",
-          "lab": "14.x.x"
-        },
-        "scripts": {
-          "test": "lab -t 100 -a code -L",
-          "test-debug": "lab -a code",
-          "test-cov-html": "lab -r html -o coverage.html -a code",
-          "toc": "hapitoc",
-          "version": "npm run toc && git add API.md README.md",
-          "browserify": "NODE_ENV=production browserify lib/index.js --standalone joi > dist/joi.js",
-          "babel": "babel dist/joi.js --compact=false --out-file dist/joi.js",
-          "build": "npm run browserify && npm run babel"
-        },
-        "license": "BSD-3-Clause"
-      };
-    }, {}], 30: [function (require, module, exports) {
-      arguments[4][1][0].apply(exports, arguments);
-    }, { "dup": 1 }], 31: [function (require, module, exports) {
+    }, { "./escape": 27, "_process": 150, "buffer": 76, "crypto": 85, "path": 143, "util": 187 }], 29: [function (require, module, exports) {}, {}], 30: [function (require, module, exports) {
       var asn1 = exports;
 
       asn1.bignum = require('bn.js');
@@ -9062,7 +9056,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       asn1.constants = require('./asn1/constants');
       asn1.decoders = require('./asn1/decoders');
       asn1.encoders = require('./asn1/encoders');
-    }, { "./asn1/api": 32, "./asn1/base": 34, "./asn1/constants": 38, "./asn1/decoders": 40, "./asn1/encoders": 43, "bn.js": 46 }], 32: [function (require, module, exports) {
+    }, { "./asn1/api": 31, "./asn1/base": 33, "./asn1/constants": 37, "./asn1/decoders": 39, "./asn1/encoders": 42, "bn.js": 45 }], 31: [function (require, module, exports) {
       var asn1 = require('../asn1');
       var inherits = require('inherits');
 
@@ -9118,7 +9112,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       Entity.prototype.encode = function encode(data, enc, /* internal */reporter) {
         return this._getEncoder(enc).encode(data, reporter);
       };
-    }, { "../asn1": 31, "inherits": 131, "vm": 189 }], 33: [function (require, module, exports) {
+    }, { "../asn1": 30, "inherits": 130, "vm": 188 }], 32: [function (require, module, exports) {
       var inherits = require('inherits');
       var Reporter = require('../base').Reporter;
       var Buffer = require('buffer').Buffer;
@@ -9221,14 +9215,14 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         return out;
       };
-    }, { "../base": 34, "buffer": 77, "inherits": 131 }], 34: [function (require, module, exports) {
+    }, { "../base": 33, "buffer": 76, "inherits": 130 }], 33: [function (require, module, exports) {
       var base = exports;
 
       base.Reporter = require('./reporter').Reporter;
       base.DecoderBuffer = require('./buffer').DecoderBuffer;
       base.EncoderBuffer = require('./buffer').EncoderBuffer;
       base.Node = require('./node');
-    }, { "./buffer": 33, "./node": 35, "./reporter": 36 }], 35: [function (require, module, exports) {
+    }, { "./buffer": 32, "./node": 34, "./reporter": 35 }], 34: [function (require, module, exports) {
       var Reporter = require('../base').Reporter;
       var EncoderBuffer = require('../base').EncoderBuffer;
       var DecoderBuffer = require('../base').DecoderBuffer;
@@ -9752,7 +9746,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         return (/^[A-Za-z0-9 '\(\)\+,\-\.\/:=\?]*$/.test(str)
         );
       };
-    }, { "../base": 34, "minimalistic-assert": 137 }], 36: [function (require, module, exports) {
+    }, { "../base": 33, "minimalistic-assert": 136 }], 35: [function (require, module, exports) {
       var inherits = require('inherits');
 
       function Reporter(options) {
@@ -9869,7 +9863,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         }
         return this;
       };
-    }, { "inherits": 131 }], 37: [function (require, module, exports) {
+    }, { "inherits": 130 }], 36: [function (require, module, exports) {
       var constants = require('../constants');
 
       exports.tagClass = {
@@ -9912,7 +9906,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         0x1e: 'bmpstr'
       };
       exports.tagByName = constants._reverse(exports.tag);
-    }, { "../constants": 38 }], 38: [function (require, module, exports) {
+    }, { "../constants": 37 }], 37: [function (require, module, exports) {
       var constants = exports;
 
       // Helper
@@ -9931,7 +9925,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       };
 
       constants.der = require('./der');
-    }, { "./der": 37 }], 39: [function (require, module, exports) {
+    }, { "./der": 36 }], 38: [function (require, module, exports) {
       var inherits = require('inherits');
 
       var asn1 = require('../../asn1');
@@ -10206,12 +10200,12 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         return len;
       }
-    }, { "../../asn1": 31, "inherits": 131 }], 40: [function (require, module, exports) {
+    }, { "../../asn1": 30, "inherits": 130 }], 39: [function (require, module, exports) {
       var decoders = exports;
 
       decoders.der = require('./der');
       decoders.pem = require('./pem');
-    }, { "./der": 39, "./pem": 41 }], 41: [function (require, module, exports) {
+    }, { "./der": 38, "./pem": 40 }], 40: [function (require, module, exports) {
       var inherits = require('inherits');
       var Buffer = require('buffer').Buffer;
 
@@ -10256,7 +10250,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         var input = new Buffer(base64, 'base64');
         return DERDecoder.prototype.decode.call(this, input, options);
       };
-    }, { "./der": 39, "buffer": 77, "inherits": 131 }], 42: [function (require, module, exports) {
+    }, { "./der": 38, "buffer": 76, "inherits": 130 }], 41: [function (require, module, exports) {
       var inherits = require('inherits');
       var Buffer = require('buffer').Buffer;
 
@@ -10498,12 +10492,12 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         return res;
       }
-    }, { "../../asn1": 31, "buffer": 77, "inherits": 131 }], 43: [function (require, module, exports) {
+    }, { "../../asn1": 30, "buffer": 76, "inherits": 130 }], 42: [function (require, module, exports) {
       var encoders = exports;
 
       encoders.der = require('./der');
       encoders.pem = require('./pem');
-    }, { "./der": 42, "./pem": 44 }], 44: [function (require, module, exports) {
+    }, { "./der": 41, "./pem": 43 }], 43: [function (require, module, exports) {
       var inherits = require('inherits');
 
       var DEREncoder = require('./der');
@@ -10525,7 +10519,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         }out.push('-----END ' + options.label + '-----');
         return out.join('\n');
       };
-    }, { "./der": 42, "inherits": 131 }], 45: [function (require, module, exports) {
+    }, { "./der": 41, "inherits": 130 }], 44: [function (require, module, exports) {
       'use strict';
 
       exports.byteLength = byteLength;
@@ -10640,7 +10634,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         return parts.join('');
       }
-    }, {}], 46: [function (require, module, exports) {
+    }, {}], 45: [function (require, module, exports) {
       (function (module, exports) {
         'use strict';
 
@@ -14000,7 +13994,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return res._forceRed(this);
         };
       })(typeof module === 'undefined' || module, this);
-    }, { "buffer": 48 }], 47: [function (require, module, exports) {
+    }, { "buffer": 47 }], 46: [function (require, module, exports) {
       var r;
 
       module.exports = function rand(len) {
@@ -14062,9 +14056,9 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           };
         } catch (e) {}
       }
-    }, { "crypto": 48 }], 48: [function (require, module, exports) {
-      arguments[4][1][0].apply(exports, arguments);
-    }, { "dup": 1 }], 49: [function (require, module, exports) {
+    }, { "crypto": 47 }], 47: [function (require, module, exports) {
+      arguments[4][29][0].apply(exports, arguments);
+    }, { "dup": 29 }], 48: [function (require, module, exports) {
       // based on the aes implimentation in triple sec
       // https://github.com/keybase/triplesec
       // which is in turn based on the one from crypto-js
@@ -14281,7 +14275,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       };
 
       module.exports.AES = AES;
-    }, { "safe-buffer": 174 }], 50: [function (require, module, exports) {
+    }, { "safe-buffer": 173 }], 49: [function (require, module, exports) {
       var aes = require('./aes');
       var Buffer = require('safe-buffer').Buffer;
       var Transform = require('cipher-base');
@@ -14399,7 +14393,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       };
 
       module.exports = StreamCipher;
-    }, { "./aes": 49, "./ghash": 54, "./incr32": 55, "buffer-xor": 76, "cipher-base": 78, "inherits": 131, "safe-buffer": 174 }], 51: [function (require, module, exports) {
+    }, { "./aes": 48, "./ghash": 53, "./incr32": 54, "buffer-xor": 75, "cipher-base": 77, "inherits": 130, "safe-buffer": 173 }], 50: [function (require, module, exports) {
       var ciphers = require('./encrypter');
       var deciphers = require('./decrypter');
       var modes = require('./modes/list.json');
@@ -14413,7 +14407,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       exports.createDecipher = exports.Decipher = deciphers.createDecipher;
       exports.createDecipheriv = exports.Decipheriv = deciphers.createDecipheriv;
       exports.listCiphers = exports.getCiphers = getCiphers;
-    }, { "./decrypter": 52, "./encrypter": 53, "./modes/list.json": 63 }], 52: [function (require, module, exports) {
+    }, { "./decrypter": 51, "./encrypter": 52, "./modes/list.json": 62 }], 51: [function (require, module, exports) {
       var AuthCipher = require('./authCipher');
       var Buffer = require('safe-buffer').Buffer;
       var MODES = require('./modes');
@@ -14535,7 +14529,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
       exports.createDecipher = createDecipher;
       exports.createDecipheriv = createDecipheriv;
-    }, { "./aes": 49, "./authCipher": 50, "./modes": 62, "./streamCipher": 65, "cipher-base": 78, "evp_bytestokey": 114, "inherits": 131, "safe-buffer": 174 }], 53: [function (require, module, exports) {
+    }, { "./aes": 48, "./authCipher": 49, "./modes": 61, "./streamCipher": 64, "cipher-base": 77, "evp_bytestokey": 113, "inherits": 130, "safe-buffer": 173 }], 52: [function (require, module, exports) {
       var MODES = require('./modes');
       var AuthCipher = require('./authCipher');
       var Buffer = require('safe-buffer').Buffer;
@@ -14650,7 +14644,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
       exports.createCipheriv = createCipheriv;
       exports.createCipher = createCipher;
-    }, { "./aes": 49, "./authCipher": 50, "./modes": 62, "./streamCipher": 65, "cipher-base": 78, "evp_bytestokey": 114, "inherits": 131, "safe-buffer": 174 }], 54: [function (require, module, exports) {
+    }, { "./aes": 48, "./authCipher": 49, "./modes": 61, "./streamCipher": 64, "cipher-base": 77, "evp_bytestokey": 113, "inherits": 130, "safe-buffer": 173 }], 53: [function (require, module, exports) {
       var Buffer = require('safe-buffer').Buffer;
       var ZEROES = Buffer.alloc(16, 0);
 
@@ -14735,7 +14729,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       };
 
       module.exports = GHASH;
-    }, { "safe-buffer": 174 }], 55: [function (require, module, exports) {
+    }, { "safe-buffer": 173 }], 54: [function (require, module, exports) {
       function incr32(iv) {
         var len = iv.length;
         var item;
@@ -14751,7 +14745,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         }
       }
       module.exports = incr32;
-    }, {}], 56: [function (require, module, exports) {
+    }, {}], 55: [function (require, module, exports) {
       var xor = require('buffer-xor');
 
       exports.encrypt = function (self, block) {
@@ -14769,7 +14763,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         return xor(out, pad);
       };
-    }, { "buffer-xor": 76 }], 57: [function (require, module, exports) {
+    }, { "buffer-xor": 75 }], 56: [function (require, module, exports) {
       var Buffer = require('safe-buffer').Buffer;
       var xor = require('buffer-xor');
 
@@ -14803,7 +14797,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         return out;
       };
-    }, { "buffer-xor": 76, "safe-buffer": 174 }], 58: [function (require, module, exports) {
+    }, { "buffer-xor": 75, "safe-buffer": 173 }], 57: [function (require, module, exports) {
       var Buffer = require('safe-buffer').Buffer;
 
       function encryptByte(self, byteParam, decrypt) {
@@ -14846,7 +14840,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         return out;
       };
-    }, { "safe-buffer": 174 }], 59: [function (require, module, exports) {
+    }, { "safe-buffer": 173 }], 58: [function (require, module, exports) {
       var Buffer = require('safe-buffer').Buffer;
 
       function encryptByte(self, byteParam, decrypt) {
@@ -14869,7 +14863,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         return out;
       };
-    }, { "safe-buffer": 174 }], 60: [function (require, module, exports) {
+    }, { "safe-buffer": 173 }], 59: [function (require, module, exports) {
       var xor = require('buffer-xor');
       var Buffer = require('safe-buffer').Buffer;
       var incr32 = require('../incr32');
@@ -14897,7 +14891,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         self._cache = self._cache.slice(chunk.length);
         return xor(chunk, pad);
       };
-    }, { "../incr32": 55, "buffer-xor": 76, "safe-buffer": 174 }], 61: [function (require, module, exports) {
+    }, { "../incr32": 54, "buffer-xor": 75, "safe-buffer": 173 }], 60: [function (require, module, exports) {
       exports.encrypt = function (self, block) {
         return self._cipher.encryptBlock(block);
       };
@@ -14905,7 +14899,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       exports.decrypt = function (self, block) {
         return self._cipher.decryptBlock(block);
       };
-    }, {}], 62: [function (require, module, exports) {
+    }, {}], 61: [function (require, module, exports) {
       var modeModules = {
         ECB: require('./ecb'),
         CBC: require('./cbc'),
@@ -14924,7 +14918,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       }
 
       module.exports = modes;
-    }, { "./cbc": 56, "./cfb": 57, "./cfb1": 58, "./cfb8": 59, "./ctr": 60, "./ecb": 61, "./list.json": 63, "./ofb": 64 }], 63: [function (require, module, exports) {
+    }, { "./cbc": 55, "./cfb": 56, "./cfb1": 57, "./cfb8": 58, "./ctr": 59, "./ecb": 60, "./list.json": 62, "./ofb": 63 }], 62: [function (require, module, exports) {
       module.exports = {
         "aes-128-ecb": {
           "cipher": "AES",
@@ -15116,7 +15110,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           "type": "auth"
         }
       };
-    }, {}], 64: [function (require, module, exports) {
+    }, {}], 63: [function (require, module, exports) {
       (function (Buffer) {
         var xor = require('buffer-xor');
 
@@ -15135,7 +15129,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return xor(chunk, pad);
         };
       }).call(this, require("buffer").Buffer);
-    }, { "buffer": 77, "buffer-xor": 76 }], 65: [function (require, module, exports) {
+    }, { "buffer": 76, "buffer-xor": 75 }], 64: [function (require, module, exports) {
       var aes = require('./aes');
       var Buffer = require('safe-buffer').Buffer;
       var Transform = require('cipher-base');
@@ -15163,7 +15157,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       };
 
       module.exports = StreamCipher;
-    }, { "./aes": 49, "cipher-base": 78, "inherits": 131, "safe-buffer": 174 }], 66: [function (require, module, exports) {
+    }, { "./aes": 48, "cipher-base": 77, "inherits": 130, "safe-buffer": 173 }], 65: [function (require, module, exports) {
       var ebtk = require('evp_bytestokey');
       var aes = require('browserify-aes/browser');
       var DES = require('browserify-des');
@@ -15237,7 +15231,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         return Object.keys(desModes).concat(aes.getCiphers());
       }
       exports.listCiphers = exports.getCiphers = getCiphers;
-    }, { "browserify-aes/browser": 51, "browserify-aes/modes": 62, "browserify-des": 67, "browserify-des/modes": 68, "evp_bytestokey": 114 }], 67: [function (require, module, exports) {
+    }, { "browserify-aes/browser": 50, "browserify-aes/modes": 61, "browserify-des": 66, "browserify-des/modes": 67, "evp_bytestokey": 113 }], 66: [function (require, module, exports) {
       (function (Buffer) {
         var CipherBase = require('cipher-base');
         var des = require('des.js');
@@ -15283,7 +15277,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return new Buffer(this._des.final());
         };
       }).call(this, require("buffer").Buffer);
-    }, { "buffer": 77, "cipher-base": 78, "des.js": 87, "inherits": 131 }], 68: [function (require, module, exports) {
+    }, { "buffer": 76, "cipher-base": 77, "des.js": 86, "inherits": 130 }], 67: [function (require, module, exports) {
       exports['des-ecb'] = {
         key: 8,
         iv: 0
@@ -15308,7 +15302,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         key: 16,
         iv: 0
       };
-    }, {}], 69: [function (require, module, exports) {
+    }, {}], 68: [function (require, module, exports) {
       (function (Buffer) {
         var bn = require('bn.js');
         var randomBytes = require('randombytes');
@@ -15350,9 +15344,9 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return r;
         }
       }).call(this, require("buffer").Buffer);
-    }, { "bn.js": 46, "buffer": 77, "randombytes": 159 }], 70: [function (require, module, exports) {
+    }, { "bn.js": 45, "buffer": 76, "randombytes": 158 }], 69: [function (require, module, exports) {
       module.exports = require('./browser/algorithms.json');
-    }, { "./browser/algorithms.json": 71 }], 71: [function (require, module, exports) {
+    }, { "./browser/algorithms.json": 70 }], 70: [function (require, module, exports) {
       module.exports = {
         "sha224WithRSAEncryption": {
           "sign": "rsa",
@@ -15505,7 +15499,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           "id": "3020300c06082a864886f70d020505000410"
         }
       };
-    }, {}], 72: [function (require, module, exports) {
+    }, {}], 71: [function (require, module, exports) {
       module.exports = {
         "1.3.132.0.10": "secp256k1",
         "1.3.132.0.33": "p224",
@@ -15514,7 +15508,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         "1.3.132.0.34": "p384",
         "1.3.132.0.35": "p521"
       };
-    }, {}], 73: [function (require, module, exports) {
+    }, {}], 72: [function (require, module, exports) {
       (function (Buffer) {
         var createHash = require('create-hash');
         var stream = require('stream');
@@ -15608,7 +15602,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           createVerify: createVerify
         };
       }).call(this, require("buffer").Buffer);
-    }, { "./algorithms.json": 71, "./sign": 74, "./verify": 75, "buffer": 77, "create-hash": 81, "inherits": 131, "stream": 183 }], 74: [function (require, module, exports) {
+    }, { "./algorithms.json": 70, "./sign": 73, "./verify": 74, "buffer": 76, "create-hash": 80, "inherits": 130, "stream": 182 }], 73: [function (require, module, exports) {
       (function (Buffer) {
         // much of this based on https://github.com/indutny/self-signed/blob/gh-pages/lib/rsa.js
         var createHmac = require('create-hmac');
@@ -15757,7 +15751,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         module.exports.getKey = getKey;
         module.exports.makeKey = makeKey;
       }).call(this, require("buffer").Buffer);
-    }, { "./curves.json": 72, "bn.js": 46, "browserify-rsa": 69, "buffer": 77, "create-hmac": 84, "elliptic": 97, "parse-asn1": 143 }], 75: [function (require, module, exports) {
+    }, { "./curves.json": 71, "bn.js": 45, "browserify-rsa": 68, "buffer": 76, "create-hmac": 83, "elliptic": 96, "parse-asn1": 142 }], 74: [function (require, module, exports) {
       (function (Buffer) {
         // much of this based on https://github.com/indutny/self-signed/blob/gh-pages/lib/rsa.js
         var BN = require('bn.js');
@@ -15839,7 +15833,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         module.exports = verify;
       }).call(this, require("buffer").Buffer);
-    }, { "./curves.json": 72, "bn.js": 46, "buffer": 77, "elliptic": 97, "parse-asn1": 143 }], 76: [function (require, module, exports) {
+    }, { "./curves.json": 71, "bn.js": 45, "buffer": 76, "elliptic": 96, "parse-asn1": 142 }], 75: [function (require, module, exports) {
       (function (Buffer) {
         module.exports = function xor(a, b) {
           var length = Math.min(a.length, b.length);
@@ -15852,7 +15846,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return buffer;
         };
       }).call(this, require("buffer").Buffer);
-    }, { "buffer": 77 }], 77: [function (require, module, exports) {
+    }, { "buffer": 76 }], 76: [function (require, module, exports) {
       /*!
        * The buffer module from node.js, for the browser.
        *
@@ -17517,7 +17511,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       function numberIsNaN(obj) {
         return obj !== obj; // eslint-disable-line no-self-compare
       }
-    }, { "base64-js": 45, "ieee754": 129 }], 78: [function (require, module, exports) {
+    }, { "base64-js": 44, "ieee754": 128 }], 77: [function (require, module, exports) {
       var Buffer = require('safe-buffer').Buffer;
       var Transform = require('stream').Transform;
       var StringDecoder = require('string_decoder').StringDecoder;
@@ -17617,7 +17611,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       };
 
       module.exports = CipherBase;
-    }, { "inherits": 131, "safe-buffer": 174, "stream": 183, "string_decoder": 184 }], 79: [function (require, module, exports) {
+    }, { "inherits": 130, "safe-buffer": 173, "stream": 182, "string_decoder": 183 }], 78: [function (require, module, exports) {
       (function (Buffer) {
         // Copyright Joyent, Inc. and other Node contributors.
         //
@@ -17723,7 +17717,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return Object.prototype.toString.call(o);
         }
       }).call(this, { "isBuffer": require("../../is-buffer/index.js") });
-    }, { "../../is-buffer/index.js": 132 }], 80: [function (require, module, exports) {
+    }, { "../../is-buffer/index.js": 131 }], 79: [function (require, module, exports) {
       (function (Buffer) {
         var elliptic = require('elliptic');
         var BN = require('bn.js');
@@ -17848,7 +17842,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           }
         }
       }).call(this, require("buffer").Buffer);
-    }, { "bn.js": 46, "buffer": 77, "elliptic": 97 }], 81: [function (require, module, exports) {
+    }, { "bn.js": 45, "buffer": 76, "elliptic": 96 }], 80: [function (require, module, exports) {
       (function (Buffer) {
         'use strict';
 
@@ -17904,7 +17898,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return new Hash(sha(alg));
         };
       }).call(this, require("buffer").Buffer);
-    }, { "./md5": 83, "buffer": 77, "cipher-base": 78, "inherits": 131, "ripemd160": 173, "sha.js": 176 }], 82: [function (require, module, exports) {
+    }, { "./md5": 82, "buffer": 76, "cipher-base": 77, "inherits": 130, "ripemd160": 172, "sha.js": 175 }], 81: [function (require, module, exports) {
       (function (Buffer) {
         'use strict';
 
@@ -17938,7 +17932,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return buf;
         };
       }).call(this, require("buffer").Buffer);
-    }, { "buffer": 77 }], 83: [function (require, module, exports) {
+    }, { "buffer": 76 }], 82: [function (require, module, exports) {
       'use strict';
       /*
        * A JavaScript implementation of the RSA Data Security, Inc. MD5 Message
@@ -18090,7 +18084,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       module.exports = function md5(buf) {
         return makeHash(buf, core_md5);
       };
-    }, { "./make-hash": 82 }], 84: [function (require, module, exports) {
+    }, { "./make-hash": 81 }], 83: [function (require, module, exports) {
       'use strict';
 
       var inherits = require('inherits');
@@ -18154,7 +18148,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         }
         return new Hmac(alg, key);
       };
-    }, { "./legacy": 85, "cipher-base": 78, "create-hash/md5": 83, "inherits": 131, "ripemd160": 173, "safe-buffer": 174, "sha.js": 176 }], 85: [function (require, module, exports) {
+    }, { "./legacy": 84, "cipher-base": 77, "create-hash/md5": 82, "inherits": 130, "ripemd160": 172, "safe-buffer": 173, "sha.js": 175 }], 84: [function (require, module, exports) {
       'use strict';
 
       var inherits = require('inherits');
@@ -18202,7 +18196,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         return this._alg(Buffer.concat([this._opad, h]));
       };
       module.exports = Hmac;
-    }, { "cipher-base": 78, "inherits": 131, "safe-buffer": 174 }], 86: [function (require, module, exports) {
+    }, { "cipher-base": 77, "inherits": 130, "safe-buffer": 173 }], 85: [function (require, module, exports) {
       'use strict';
 
       exports.randomBytes = exports.rng = exports.pseudoRandomBytes = exports.prng = require('randombytes');
@@ -18291,7 +18285,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         'POINT_CONVERSION_UNCOMPRESSED': 4,
         'POINT_CONVERSION_HYBRID': 6
       };
-    }, { "browserify-cipher": 66, "browserify-sign": 73, "browserify-sign/algos": 70, "create-ecdh": 80, "create-hash": 81, "create-hmac": 84, "diffie-hellman": 93, "pbkdf2": 145, "public-encrypt": 152, "randombytes": 159 }], 87: [function (require, module, exports) {
+    }, { "browserify-cipher": 65, "browserify-sign": 72, "browserify-sign/algos": 69, "create-ecdh": 79, "create-hash": 80, "create-hmac": 83, "diffie-hellman": 92, "pbkdf2": 144, "public-encrypt": 151, "randombytes": 158 }], 86: [function (require, module, exports) {
       'use strict';
 
       exports.utils = require('./des/utils');
@@ -18299,7 +18293,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       exports.DES = require('./des/des');
       exports.CBC = require('./des/cbc');
       exports.EDE = require('./des/ede');
-    }, { "./des/cbc": 88, "./des/cipher": 89, "./des/des": 90, "./des/ede": 91, "./des/utils": 92 }], 88: [function (require, module, exports) {
+    }, { "./des/cbc": 87, "./des/cipher": 88, "./des/des": 89, "./des/ede": 90, "./des/utils": 91 }], 87: [function (require, module, exports) {
       'use strict';
 
       var assert = require('minimalistic-assert');
@@ -18366,7 +18360,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           }
         }
       };
-    }, { "inherits": 131, "minimalistic-assert": 137 }], 89: [function (require, module, exports) {
+    }, { "inherits": 130, "minimalistic-assert": 136 }], 88: [function (require, module, exports) {
       'use strict';
 
       var assert = require('minimalistic-assert');
@@ -18492,7 +18486,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         return this._unpad(out);
       };
-    }, { "minimalistic-assert": 137 }], 90: [function (require, module, exports) {
+    }, { "minimalistic-assert": 136 }], 89: [function (require, module, exports) {
       'use strict';
 
       var assert = require('minimalistic-assert');
@@ -18628,7 +18622,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         // Reverse Initial Permutation
         utils.rip(l, r, out, off);
       };
-    }, { "../des": 87, "inherits": 131, "minimalistic-assert": 137 }], 91: [function (require, module, exports) {
+    }, { "../des": 86, "inherits": 130, "minimalistic-assert": 136 }], 90: [function (require, module, exports) {
       'use strict';
 
       var assert = require('minimalistic-assert');
@@ -18676,7 +18670,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
       EDE.prototype._pad = DES.prototype._pad;
       EDE.prototype._unpad = DES.prototype._unpad;
-    }, { "../des": 87, "inherits": 131, "minimalistic-assert": 137 }], 92: [function (require, module, exports) {
+    }, { "../des": 86, "inherits": 130, "minimalistic-assert": 136 }], 91: [function (require, module, exports) {
       'use strict';
 
       exports.readUInt32BE = function readUInt32BE(bytes, off) {
@@ -18881,7 +18875,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           out.push(str.slice(i, i + group));
         }return out.join(' ');
       };
-    }, {}], 93: [function (require, module, exports) {
+    }, {}], 92: [function (require, module, exports) {
       (function (Buffer) {
         var generatePrime = require('./lib/generatePrime');
         var primes = require('./lib/primes.json');
@@ -18926,7 +18920,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         exports.DiffieHellmanGroup = exports.createDiffieHellmanGroup = exports.getDiffieHellman = getDiffieHellman;
         exports.createDiffieHellman = exports.DiffieHellman = createDiffieHellman;
       }).call(this, require("buffer").Buffer);
-    }, { "./lib/dh": 94, "./lib/generatePrime": 95, "./lib/primes.json": 96, "buffer": 77 }], 94: [function (require, module, exports) {
+    }, { "./lib/dh": 93, "./lib/generatePrime": 94, "./lib/primes.json": 95, "buffer": 76 }], 93: [function (require, module, exports) {
       (function (Buffer) {
         var BN = require('bn.js');
         var MillerRabin = require('miller-rabin');
@@ -19090,7 +19084,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           }
         }
       }).call(this, require("buffer").Buffer);
-    }, { "./generatePrime": 95, "bn.js": 46, "buffer": 77, "miller-rabin": 136, "randombytes": 159 }], 95: [function (require, module, exports) {
+    }, { "./generatePrime": 94, "bn.js": 45, "buffer": 76, "miller-rabin": 135, "randombytes": 158 }], 94: [function (require, module, exports) {
       var randomBytes = require('randombytes');
       module.exports = findPrime;
       findPrime.simpleSieve = simpleSieve;
@@ -19188,7 +19182,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           }
         }
       }
-    }, { "bn.js": 46, "miller-rabin": 136, "randombytes": 159 }], 96: [function (require, module, exports) {
+    }, { "bn.js": 45, "miller-rabin": 135, "randombytes": 158 }], 95: [function (require, module, exports) {
       module.exports = {
         "modp1": {
           "gen": "02",
@@ -19223,7 +19217,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           "prime": "ffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7edee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a163bf0598da48361c55d39a69163fa8fd24cf5f83655d23dca3ad961c62f356208552bb9ed529077096966d670c354e4abc9804f1746c08ca18217c32905e462e36ce3be39e772c180e86039b2783a2ec07a28fb5c55df06f4c52c9de2bcbf6955817183995497cea956ae515d2261898fa051015728e5a8aaac42dad33170d04507a33a85521abdf1cba64ecfb850458dbef0a8aea71575d060c7db3970f85a6e1e4c7abf5ae8cdb0933d71e8c94e04a25619dcee3d2261ad2ee6bf12ffa06d98a0864d87602733ec86a64521f2b18177b200cbbe117577a615d6c770988c0bad946e208e24fa074e5ab3143db5bfce0fd108e4b82d120a92108011a723c12a787e6d788719a10bdba5b2699c327186af4e23c1a946834b6150bda2583e9ca2ad44ce8dbbbc2db04de8ef92e8efc141fbecaa6287c59474e6bc05d99b2964fa090c3a2233ba186515be7ed1f612970cee2d7afb81bdd762170481cd0069127d5b05aa993b4ea988d8fddc186ffb7dc90a6c08f4df435c93402849236c3fab4d27c7026c1d4dcb2602646dec9751e763dba37bdf8ff9406ad9e530ee5db382f413001aeb06a53ed9027d831179727b0865a8918da3edbebcf9b14ed44ce6cbaced4bb1bdb7f1447e6cc254b332051512bd7af426fb8f401378cd2bf5983ca01c64b92ecf032ea15d1721d03f482d7ce6e74fef6d55e702f46980c82b5a84031900b1c9e59e7c97fbec7e8f323a97a7e36cc88be0f1d45b7ff585ac54bd407b22b4154aacc8f6d7ebf48e1d814cc5ed20f8037e0a79715eef29be32806a1d58bb7c5da76f550aa3d8a1fbff0eb19ccb1a313d55cda56c9ec2ef29632387fe8d76e3c0468043e8f663f4860ee12bf2d5b0b7474d6e694f91e6dbe115974a3926f12fee5e438777cb6a932df8cd8bec4d073b931ba3bc832b68d9dd300741fa7bf8afc47ed2576f6936ba424663aab639c5ae4f5683423b4742bf1c978238f16cbe39d652de3fdb8befc848ad922222e04a4037c0713eb57a81a23f0c73473fc646cea306b4bcbc8862f8385ddfa9d4b7fa2c087e879683303ed5bdd3a062b3cf5b3a278a66d2a13f83f44f82ddf310ee074ab6a364597e899a0255dc164f31cc50846851df9ab48195ded7ea1b1d510bd7ee74d73faf36bc31ecfa268359046f4eb879f924009438b481c6cd7889a002ed5ee382bc9190da6fc026e479558e4475677e9aa9e3050e2765694dfc81f56e880b96e7160c980dd98edd3dfffffffffffffffff"
         }
       };
-    }, {}], 97: [function (require, module, exports) {
+    }, {}], 96: [function (require, module, exports) {
       'use strict';
 
       var elliptic = exports;
@@ -19237,7 +19231,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       // Protocols
       elliptic.ec = require('./elliptic/ec');
       elliptic.eddsa = require('./elliptic/eddsa');
-    }, { "../package.json": 112, "./elliptic/curve": 100, "./elliptic/curves": 103, "./elliptic/ec": 104, "./elliptic/eddsa": 107, "./elliptic/utils": 111, "brorand": 47 }], 98: [function (require, module, exports) {
+    }, { "../package.json": 111, "./elliptic/curve": 99, "./elliptic/curves": 102, "./elliptic/ec": 103, "./elliptic/eddsa": 106, "./elliptic/utils": 110, "brorand": 46 }], 97: [function (require, module, exports) {
       'use strict';
 
       var BN = require('bn.js');
@@ -19568,7 +19562,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           r = r.dbl();
         }return r;
       };
-    }, { "../../elliptic": 97, "bn.js": 46 }], 99: [function (require, module, exports) {
+    }, { "../../elliptic": 96, "bn.js": 45 }], 98: [function (require, module, exports) {
       'use strict';
 
       var curve = require('../curve');
@@ -19955,7 +19949,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       // Compatibility with BaseCurve
       Point.prototype.toP = Point.prototype.normalize;
       Point.prototype.mixedAdd = Point.prototype.add;
-    }, { "../../elliptic": 97, "../curve": 100, "bn.js": 46, "inherits": 131 }], 100: [function (require, module, exports) {
+    }, { "../../elliptic": 96, "../curve": 99, "bn.js": 45, "inherits": 130 }], 99: [function (require, module, exports) {
       'use strict';
 
       var curve = exports;
@@ -19964,7 +19958,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       curve.short = require('./short');
       curve.mont = require('./mont');
       curve.edwards = require('./edwards');
-    }, { "./base": 98, "./edwards": 99, "./mont": 101, "./short": 102 }], 101: [function (require, module, exports) {
+    }, { "./base": 97, "./edwards": 98, "./mont": 100, "./short": 101 }], 100: [function (require, module, exports) {
       'use strict';
 
       var curve = require('../curve');
@@ -20140,7 +20134,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         return this.x.fromRed();
       };
-    }, { "../../elliptic": 97, "../curve": 100, "bn.js": 46, "inherits": 131 }], 102: [function (require, module, exports) {
+    }, { "../../elliptic": 96, "../curve": 99, "bn.js": 45, "inherits": 130 }], 101: [function (require, module, exports) {
       'use strict';
 
       var curve = require('../curve');
@@ -21004,7 +20998,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         // XXX This code assumes that zero is always zero in red
         return this.z.cmpn(0) === 0;
       };
-    }, { "../../elliptic": 97, "../curve": 100, "bn.js": 46, "inherits": 131 }], 103: [function (require, module, exports) {
+    }, { "../../elliptic": 96, "../curve": 99, "bn.js": 45, "inherits": 130 }], 102: [function (require, module, exports) {
       'use strict';
 
       var curves = exports;
@@ -21161,7 +21155,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         gRed: false,
         g: ['79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798', '483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8', pre]
       });
-    }, { "../elliptic": 97, "./precomputed/secp256k1": 110, "hash.js": 116 }], 104: [function (require, module, exports) {
+    }, { "../elliptic": 96, "./precomputed/secp256k1": 109, "hash.js": 115 }], 103: [function (require, module, exports) {
       'use strict';
 
       var BN = require('bn.js');
@@ -21376,7 +21370,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         }
         throw new Error('Unable to find valid recovery factor');
       };
-    }, { "../../elliptic": 97, "./key": 105, "./signature": 106, "bn.js": 46, "hmac-drbg": 128 }], 105: [function (require, module, exports) {
+    }, { "../../elliptic": 96, "./key": 104, "./signature": 105, "bn.js": 45, "hmac-drbg": 127 }], 104: [function (require, module, exports) {
       'use strict';
 
       var BN = require('bn.js');
@@ -21482,7 +21476,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       KeyPair.prototype.inspect = function inspect() {
         return '<Key priv: ' + (this.priv && this.priv.toString(16, 2)) + ' pub: ' + (this.pub && this.pub.inspect()) + ' >';
       };
-    }, { "../../elliptic": 97, "bn.js": 46 }], 106: [function (require, module, exports) {
+    }, { "../../elliptic": 96, "bn.js": 45 }], 105: [function (require, module, exports) {
       'use strict';
 
       var BN = require('bn.js');
@@ -21611,7 +21605,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         res = res.concat(backHalf);
         return utils.encode(res, enc);
       };
-    }, { "../../elliptic": 97, "bn.js": 46 }], 107: [function (require, module, exports) {
+    }, { "../../elliptic": 96, "bn.js": 45 }], 106: [function (require, module, exports) {
       'use strict';
 
       var hash = require('hash.js');
@@ -21727,7 +21721,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       EDDSA.prototype.isPoint = function isPoint(val) {
         return val instanceof this.pointClass;
       };
-    }, { "../../elliptic": 97, "./key": 108, "./signature": 109, "hash.js": 116 }], 108: [function (require, module, exports) {
+    }, { "../../elliptic": 96, "./key": 107, "./signature": 108, "hash.js": 115 }], 107: [function (require, module, exports) {
       'use strict';
 
       var elliptic = require('../../elliptic');
@@ -21818,7 +21812,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       };
 
       module.exports = KeyPair;
-    }, { "../../elliptic": 97 }], 109: [function (require, module, exports) {
+    }, { "../../elliptic": 96 }], 108: [function (require, module, exports) {
       'use strict';
 
       var BN = require('bn.js');
@@ -21882,7 +21876,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       };
 
       module.exports = Signature;
-    }, { "../../elliptic": 97, "bn.js": 46 }], 110: [function (require, module, exports) {
+    }, { "../../elliptic": 96, "bn.js": 45 }], 109: [function (require, module, exports) {
       module.exports = {
         doubles: {
           step: 4,
@@ -21893,7 +21887,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           points: [['f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9', '388f7b0f632de8140fe337e62a37f3566500a99934c2231b6cb9fd7584b8e672'], ['2f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4', 'd8ac222636e5e3d6d4dba9dda6c9c426f788271bab0d6840dca87d3aa6ac62d6'], ['5cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc', '6aebca40ba255960a3178d6d861a54dba813d0b813fde7b5a5082628087264da'], ['acd484e2f0c7f65309ad178a9f559abde09796974c57e714c35f110dfc27ccbe', 'cc338921b0a7d9fd64380971763b61e9add888a4375f8e0f05cc262ac64f9c37'], ['774ae7f858a9411e5ef4246b70c65aac5649980be5c17891bbec17895da008cb', 'd984a032eb6b5e190243dd56d7b7b365372db1e2dff9d6a8301d74c9c953c61b'], ['f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8', 'ab0902e8d880a89758212eb65cdaf473a1a06da521fa91f29b5cb52db03ed81'], ['d7924d4f7d43ea965a465ae3095ff41131e5946f3c85f79e44adbcf8e27e080e', '581e2872a86c72a683842ec228cc6defea40af2bd896d3a5c504dc9ff6a26b58'], ['defdea4cdb677750a420fee807eacf21eb9898ae79b9768766e4faa04a2d4a34', '4211ab0694635168e997b0ead2a93daeced1f4a04a95c0f6cfb199f69e56eb77'], ['2b4ea0a797a443d293ef5cff444f4979f06acfebd7e86d277475656138385b6c', '85e89bc037945d93b343083b5a1c86131a01f60c50269763b570c854e5c09b7a'], ['352bbf4a4cdd12564f93fa332ce333301d9ad40271f8107181340aef25be59d5', '321eb4075348f534d59c18259dda3e1f4a1b3b2e71b1039c67bd3d8bcf81998c'], ['2fa2104d6b38d11b0230010559879124e42ab8dfeff5ff29dc9cdadd4ecacc3f', '2de1068295dd865b64569335bd5dd80181d70ecfc882648423ba76b532b7d67'], ['9248279b09b4d68dab21a9b066edda83263c3d84e09572e269ca0cd7f5453714', '73016f7bf234aade5d1aa71bdea2b1ff3fc0de2a887912ffe54a32ce97cb3402'], ['daed4f2be3a8bf278e70132fb0beb7522f570e144bf615c07e996d443dee8729', 'a69dce4a7d6c98e8d4a1aca87ef8d7003f83c230f3afa726ab40e52290be1c55'], ['c44d12c7065d812e8acf28d7cbb19f9011ecd9e9fdf281b0e6a3b5e87d22e7db', '2119a460ce326cdc76c45926c982fdac0e106e861edf61c5a039063f0e0e6482'], ['6a245bf6dc698504c89a20cfded60853152b695336c28063b61c65cbd269e6b4', 'e022cf42c2bd4a708b3f5126f16a24ad8b33ba48d0423b6efd5e6348100d8a82'], ['1697ffa6fd9de627c077e3d2fe541084ce13300b0bec1146f95ae57f0d0bd6a5', 'b9c398f186806f5d27561506e4557433a2cf15009e498ae7adee9d63d01b2396'], ['605bdb019981718b986d0f07e834cb0d9deb8360ffb7f61df982345ef27a7479', '2972d2de4f8d20681a78d93ec96fe23c26bfae84fb14db43b01e1e9056b8c49'], ['62d14dab4150bf497402fdc45a215e10dcb01c354959b10cfe31c7e9d87ff33d', '80fc06bd8cc5b01098088a1950eed0db01aa132967ab472235f5642483b25eaf'], ['80c60ad0040f27dade5b4b06c408e56b2c50e9f56b9b8b425e555c2f86308b6f', '1c38303f1cc5c30f26e66bad7fe72f70a65eed4cbe7024eb1aa01f56430bd57a'], ['7a9375ad6167ad54aa74c6348cc54d344cc5dc9487d847049d5eabb0fa03c8fb', 'd0e3fa9eca8726909559e0d79269046bdc59ea10c70ce2b02d499ec224dc7f7'], ['d528ecd9b696b54c907a9ed045447a79bb408ec39b68df504bb51f459bc3ffc9', 'eecf41253136e5f99966f21881fd656ebc4345405c520dbc063465b521409933'], ['49370a4b5f43412ea25f514e8ecdad05266115e4a7ecb1387231808f8b45963', '758f3f41afd6ed428b3081b0512fd62a54c3f3afbb5b6764b653052a12949c9a'], ['77f230936ee88cbbd73df930d64702ef881d811e0e1498e2f1c13eb1fc345d74', '958ef42a7886b6400a08266e9ba1b37896c95330d97077cbbe8eb3c7671c60d6'], ['f2dac991cc4ce4b9ea44887e5c7c0bce58c80074ab9d4dbaeb28531b7739f530', 'e0dedc9b3b2f8dad4da1f32dec2531df9eb5fbeb0598e4fd1a117dba703a3c37'], ['463b3d9f662621fb1b4be8fbbe2520125a216cdfc9dae3debcba4850c690d45b', '5ed430d78c296c3543114306dd8622d7c622e27c970a1de31cb377b01af7307e'], ['f16f804244e46e2a09232d4aff3b59976b98fac14328a2d1a32496b49998f247', 'cedabd9b82203f7e13d206fcdf4e33d92a6c53c26e5cce26d6579962c4e31df6'], ['caf754272dc84563b0352b7a14311af55d245315ace27c65369e15f7151d41d1', 'cb474660ef35f5f2a41b643fa5e460575f4fa9b7962232a5c32f908318a04476'], ['2600ca4b282cb986f85d0f1709979d8b44a09c07cb86d7c124497bc86f082120', '4119b88753c15bd6a693b03fcddbb45d5ac6be74ab5f0ef44b0be9475a7e4b40'], ['7635ca72d7e8432c338ec53cd12220bc01c48685e24f7dc8c602a7746998e435', '91b649609489d613d1d5e590f78e6d74ecfc061d57048bad9e76f302c5b9c61'], ['754e3239f325570cdbbf4a87deee8a66b7f2b33479d468fbc1a50743bf56cc18', '673fb86e5bda30fb3cd0ed304ea49a023ee33d0197a695d0c5d98093c536683'], ['e3e6bd1071a1e96aff57859c82d570f0330800661d1c952f9fe2694691d9b9e8', '59c9e0bba394e76f40c0aa58379a3cb6a5a2283993e90c4167002af4920e37f5'], ['186b483d056a033826ae73d88f732985c4ccb1f32ba35f4b4cc47fdcf04aa6eb', '3b952d32c67cf77e2e17446e204180ab21fb8090895138b4a4a797f86e80888b'], ['df9d70a6b9876ce544c98561f4be4f725442e6d2b737d9c91a8321724ce0963f', '55eb2dafd84d6ccd5f862b785dc39d4ab157222720ef9da217b8c45cf2ba2417'], ['5edd5cc23c51e87a497ca815d5dce0f8ab52554f849ed8995de64c5f34ce7143', 'efae9c8dbc14130661e8cec030c89ad0c13c66c0d17a2905cdc706ab7399a868'], ['290798c2b6476830da12fe02287e9e777aa3fba1c355b17a722d362f84614fba', 'e38da76dcd440621988d00bcf79af25d5b29c094db2a23146d003afd41943e7a'], ['af3c423a95d9f5b3054754efa150ac39cd29552fe360257362dfdecef4053b45', 'f98a3fd831eb2b749a93b0e6f35cfb40c8cd5aa667a15581bc2feded498fd9c6'], ['766dbb24d134e745cccaa28c99bf274906bb66b26dcf98df8d2fed50d884249a', '744b1152eacbe5e38dcc887980da38b897584a65fa06cedd2c924f97cbac5996'], ['59dbf46f8c94759ba21277c33784f41645f7b44f6c596a58ce92e666191abe3e', 'c534ad44175fbc300f4ea6ce648309a042ce739a7919798cd85e216c4a307f6e'], ['f13ada95103c4537305e691e74e9a4a8dd647e711a95e73cb62dc6018cfd87b8', 'e13817b44ee14de663bf4bc808341f326949e21a6a75c2570778419bdaf5733d'], ['7754b4fa0e8aced06d4167a2c59cca4cda1869c06ebadfb6488550015a88522c', '30e93e864e669d82224b967c3020b8fa8d1e4e350b6cbcc537a48b57841163a2'], ['948dcadf5990e048aa3874d46abef9d701858f95de8041d2a6828c99e2262519', 'e491a42537f6e597d5d28a3224b1bc25df9154efbd2ef1d2cbba2cae5347d57e'], ['7962414450c76c1689c7b48f8202ec37fb224cf5ac0bfa1570328a8a3d7c77ab', '100b610ec4ffb4760d5c1fc133ef6f6b12507a051f04ac5760afa5b29db83437'], ['3514087834964b54b15b160644d915485a16977225b8847bb0dd085137ec47ca', 'ef0afbb2056205448e1652c48e8127fc6039e77c15c2378b7e7d15a0de293311'], ['d3cc30ad6b483e4bc79ce2c9dd8bc54993e947eb8df787b442943d3f7b527eaf', '8b378a22d827278d89c5e9be8f9508ae3c2ad46290358630afb34db04eede0a4'], ['1624d84780732860ce1c78fcbfefe08b2b29823db913f6493975ba0ff4847610', '68651cf9b6da903e0914448c6cd9d4ca896878f5282be4c8cc06e2a404078575'], ['733ce80da955a8a26902c95633e62a985192474b5af207da6df7b4fd5fc61cd4', 'f5435a2bd2badf7d485a4d8b8db9fcce3e1ef8e0201e4578c54673bc1dc5ea1d'], ['15d9441254945064cf1a1c33bbd3b49f8966c5092171e699ef258dfab81c045c', 'd56eb30b69463e7234f5137b73b84177434800bacebfc685fc37bbe9efe4070d'], ['a1d0fcf2ec9de675b612136e5ce70d271c21417c9d2b8aaaac138599d0717940', 'edd77f50bcb5a3cab2e90737309667f2641462a54070f3d519212d39c197a629'], ['e22fbe15c0af8ccc5780c0735f84dbe9a790badee8245c06c7ca37331cb36980', 'a855babad5cd60c88b430a69f53a1a7a38289154964799be43d06d77d31da06'], ['311091dd9860e8e20ee13473c1155f5f69635e394704eaa74009452246cfa9b3', '66db656f87d1f04fffd1f04788c06830871ec5a64feee685bd80f0b1286d8374'], ['34c1fd04d301be89b31c0442d3e6ac24883928b45a9340781867d4232ec2dbdf', '9414685e97b1b5954bd46f730174136d57f1ceeb487443dc5321857ba73abee'], ['f219ea5d6b54701c1c14de5b557eb42a8d13f3abbcd08affcc2a5e6b049b8d63', '4cb95957e83d40b0f73af4544cccf6b1f4b08d3c07b27fb8d8c2962a400766d1'], ['d7b8740f74a8fbaab1f683db8f45de26543a5490bca627087236912469a0b448', 'fa77968128d9c92ee1010f337ad4717eff15db5ed3c049b3411e0315eaa4593b'], ['32d31c222f8f6f0ef86f7c98d3a3335ead5bcd32abdd94289fe4d3091aa824bf', '5f3032f5892156e39ccd3d7915b9e1da2e6dac9e6f26e961118d14b8462e1661'], ['7461f371914ab32671045a155d9831ea8793d77cd59592c4340f86cbc18347b5', '8ec0ba238b96bec0cbdddcae0aa442542eee1ff50c986ea6b39847b3cc092ff6'], ['ee079adb1df1860074356a25aa38206a6d716b2c3e67453d287698bad7b2b2d6', '8dc2412aafe3be5c4c5f37e0ecc5f9f6a446989af04c4e25ebaac479ec1c8c1e'], ['16ec93e447ec83f0467b18302ee620f7e65de331874c9dc72bfd8616ba9da6b5', '5e4631150e62fb40d0e8c2a7ca5804a39d58186a50e497139626778e25b0674d'], ['eaa5f980c245f6f038978290afa70b6bd8855897f98b6aa485b96065d537bd99', 'f65f5d3e292c2e0819a528391c994624d784869d7e6ea67fb18041024edc07dc'], ['78c9407544ac132692ee1910a02439958ae04877151342ea96c4b6b35a49f51', 'f3e0319169eb9b85d5404795539a5e68fa1fbd583c064d2462b675f194a3ddb4'], ['494f4be219a1a77016dcd838431aea0001cdc8ae7a6fc688726578d9702857a5', '42242a969283a5f339ba7f075e36ba2af925ce30d767ed6e55f4b031880d562c'], ['a598a8030da6d86c6bc7f2f5144ea549d28211ea58faa70ebf4c1e665c1fe9b5', '204b5d6f84822c307e4b4a7140737aec23fc63b65b35f86a10026dbd2d864e6b'], ['c41916365abb2b5d09192f5f2dbeafec208f020f12570a184dbadc3e58595997', '4f14351d0087efa49d245b328984989d5caf9450f34bfc0ed16e96b58fa9913'], ['841d6063a586fa475a724604da03bc5b92a2e0d2e0a36acfe4c73a5514742881', '73867f59c0659e81904f9a1c7543698e62562d6744c169ce7a36de01a8d6154'], ['5e95bb399a6971d376026947f89bde2f282b33810928be4ded112ac4d70e20d5', '39f23f366809085beebfc71181313775a99c9aed7d8ba38b161384c746012865'], ['36e4641a53948fd476c39f8a99fd974e5ec07564b5315d8bf99471bca0ef2f66', 'd2424b1b1abe4eb8164227b085c9aa9456ea13493fd563e06fd51cf5694c78fc'], ['336581ea7bfbbb290c191a2f507a41cf5643842170e914faeab27c2c579f726', 'ead12168595fe1be99252129b6e56b3391f7ab1410cd1e0ef3dcdcabd2fda224'], ['8ab89816dadfd6b6a1f2634fcf00ec8403781025ed6890c4849742706bd43ede', '6fdcef09f2f6d0a044e654aef624136f503d459c3e89845858a47a9129cdd24e'], ['1e33f1a746c9c5778133344d9299fcaa20b0938e8acff2544bb40284b8c5fb94', '60660257dd11b3aa9c8ed618d24edff2306d320f1d03010e33a7d2057f3b3b6'], ['85b7c1dcb3cec1b7ee7f30ded79dd20a0ed1f4cc18cbcfcfa410361fd8f08f31', '3d98a9cdd026dd43f39048f25a8847f4fcafad1895d7a633c6fed3c35e999511'], ['29df9fbd8d9e46509275f4b125d6d45d7fbe9a3b878a7af872a2800661ac5f51', 'b4c4fe99c775a606e2d8862179139ffda61dc861c019e55cd2876eb2a27d84b'], ['a0b1cae06b0a847a3fea6e671aaf8adfdfe58ca2f768105c8082b2e449fce252', 'ae434102edde0958ec4b19d917a6a28e6b72da1834aff0e650f049503a296cf2'], ['4e8ceafb9b3e9a136dc7ff67e840295b499dfb3b2133e4ba113f2e4c0e121e5', 'cf2174118c8b6d7a4b48f6d534ce5c79422c086a63460502b827ce62a326683c'], ['d24a44e047e19b6f5afb81c7ca2f69080a5076689a010919f42725c2b789a33b', '6fb8d5591b466f8fc63db50f1c0f1c69013f996887b8244d2cdec417afea8fa3'], ['ea01606a7a6c9cdd249fdfcfacb99584001edd28abbab77b5104e98e8e3b35d4', '322af4908c7312b0cfbfe369f7a7b3cdb7d4494bc2823700cfd652188a3ea98d'], ['af8addbf2b661c8a6c6328655eb96651252007d8c5ea31be4ad196de8ce2131f', '6749e67c029b85f52a034eafd096836b2520818680e26ac8f3dfbcdb71749700'], ['e3ae1974566ca06cc516d47e0fb165a674a3dabcfca15e722f0e3450f45889', '2aeabe7e4531510116217f07bf4d07300de97e4874f81f533420a72eeb0bd6a4'], ['591ee355313d99721cf6993ffed1e3e301993ff3ed258802075ea8ced397e246', 'b0ea558a113c30bea60fc4775460c7901ff0b053d25ca2bdeee98f1a4be5d196'], ['11396d55fda54c49f19aa97318d8da61fa8584e47b084945077cf03255b52984', '998c74a8cd45ac01289d5833a7beb4744ff536b01b257be4c5767bea93ea57a4'], ['3c5d2a1ba39c5a1790000738c9e0c40b8dcdfd5468754b6405540157e017aa7a', 'b2284279995a34e2f9d4de7396fc18b80f9b8b9fdd270f6661f79ca4c81bd257'], ['cc8704b8a60a0defa3a99a7299f2e9c3fbc395afb04ac078425ef8a1793cc030', 'bdd46039feed17881d1e0862db347f8cf395b74fc4bcdc4e940b74e3ac1f1b13'], ['c533e4f7ea8555aacd9777ac5cad29b97dd4defccc53ee7ea204119b2889b197', '6f0a256bc5efdf429a2fb6242f1a43a2d9b925bb4a4b3a26bb8e0f45eb596096'], ['c14f8f2ccb27d6f109f6d08d03cc96a69ba8c34eec07bbcf566d48e33da6593', 'c359d6923bb398f7fd4473e16fe1c28475b740dd098075e6c0e8649113dc3a38'], ['a6cbc3046bc6a450bac24789fa17115a4c9739ed75f8f21ce441f72e0b90e6ef', '21ae7f4680e889bb130619e2c0f95a360ceb573c70603139862afd617fa9b9f'], ['347d6d9a02c48927ebfb86c1359b1caf130a3c0267d11ce6344b39f99d43cc38', '60ea7f61a353524d1c987f6ecec92f086d565ab687870cb12689ff1e31c74448'], ['da6545d2181db8d983f7dcb375ef5866d47c67b1bf31c8cf855ef7437b72656a', '49b96715ab6878a79e78f07ce5680c5d6673051b4935bd897fea824b77dc208a'], ['c40747cc9d012cb1a13b8148309c6de7ec25d6945d657146b9d5994b8feb1111', '5ca560753be2a12fc6de6caf2cb489565db936156b9514e1bb5e83037e0fa2d4'], ['4e42c8ec82c99798ccf3a610be870e78338c7f713348bd34c8203ef4037f3502', '7571d74ee5e0fb92a7a8b33a07783341a5492144cc54bcc40a94473693606437'], ['3775ab7089bc6af823aba2e1af70b236d251cadb0c86743287522a1b3b0dedea', 'be52d107bcfa09d8bcb9736a828cfa7fac8db17bf7a76a2c42ad961409018cf7'], ['cee31cbf7e34ec379d94fb814d3d775ad954595d1314ba8846959e3e82f74e26', '8fd64a14c06b589c26b947ae2bcf6bfa0149ef0be14ed4d80f448a01c43b1c6d'], ['b4f9eaea09b6917619f6ea6a4eb5464efddb58fd45b1ebefcdc1a01d08b47986', '39e5c9925b5a54b07433a4f18c61726f8bb131c012ca542eb24a8ac07200682a'], ['d4263dfc3d2df923a0179a48966d30ce84e2515afc3dccc1b77907792ebcc60e', '62dfaf07a0f78feb30e30d6295853ce189e127760ad6cf7fae164e122a208d54'], ['48457524820fa65a4f8d35eb6930857c0032acc0a4a2de422233eeda897612c4', '25a748ab367979d98733c38a1fa1c2e7dc6cc07db2d60a9ae7a76aaa49bd0f77'], ['dfeeef1881101f2cb11644f3a2afdfc2045e19919152923f367a1767c11cceda', 'ecfb7056cf1de042f9420bab396793c0c390bde74b4bbdff16a83ae09a9a7517'], ['6d7ef6b17543f8373c573f44e1f389835d89bcbc6062ced36c82df83b8fae859', 'cd450ec335438986dfefa10c57fea9bcc521a0959b2d80bbf74b190dca712d10'], ['e75605d59102a5a2684500d3b991f2e3f3c88b93225547035af25af66e04541f', 'f5c54754a8f71ee540b9b48728473e314f729ac5308b06938360990e2bfad125'], ['eb98660f4c4dfaa06a2be453d5020bc99a0c2e60abe388457dd43fefb1ed620c', '6cb9a8876d9cb8520609af3add26cd20a0a7cd8a9411131ce85f44100099223e'], ['13e87b027d8514d35939f2e6892b19922154596941888336dc3563e3b8dba942', 'fef5a3c68059a6dec5d624114bf1e91aac2b9da568d6abeb2570d55646b8adf1'], ['ee163026e9fd6fe017c38f06a5be6fc125424b371ce2708e7bf4491691e5764a', '1acb250f255dd61c43d94ccc670d0f58f49ae3fa15b96623e5430da0ad6c62b2'], ['b268f5ef9ad51e4d78de3a750c2dc89b1e626d43505867999932e5db33af3d80', '5f310d4b3c99b9ebb19f77d41c1dee018cf0d34fd4191614003e945a1216e423'], ['ff07f3118a9df035e9fad85eb6c7bfe42b02f01ca99ceea3bf7ffdba93c4750d', '438136d603e858a3a5c440c38eccbaddc1d2942114e2eddd4740d098ced1f0d8'], ['8d8b9855c7c052a34146fd20ffb658bea4b9f69e0d825ebec16e8c3ce2b526a1', 'cdb559eedc2d79f926baf44fb84ea4d44bcf50fee51d7ceb30e2e7f463036758'], ['52db0b5384dfbf05bfa9d472d7ae26dfe4b851ceca91b1eba54263180da32b63', 'c3b997d050ee5d423ebaf66a6db9f57b3180c902875679de924b69d84a7b375'], ['e62f9490d3d51da6395efd24e80919cc7d0f29c3f3fa48c6fff543becbd43352', '6d89ad7ba4876b0b22c2ca280c682862f342c8591f1daf5170e07bfd9ccafa7d'], ['7f30ea2476b399b4957509c88f77d0191afa2ff5cb7b14fd6d8e7d65aaab1193', 'ca5ef7d4b231c94c3b15389a5f6311e9daff7bb67b103e9880ef4bff637acaec'], ['5098ff1e1d9f14fb46a210fada6c903fef0fb7b4a1dd1d9ac60a0361800b7a00', '9731141d81fc8f8084d37c6e7542006b3ee1b40d60dfe5362a5b132fd17ddc0'], ['32b78c7de9ee512a72895be6b9cbefa6e2f3c4ccce445c96b9f2c81e2778ad58', 'ee1849f513df71e32efc3896ee28260c73bb80547ae2275ba497237794c8753c'], ['e2cb74fddc8e9fbcd076eef2a7c72b0ce37d50f08269dfc074b581550547a4f7', 'd3aa2ed71c9dd2247a62df062736eb0baddea9e36122d2be8641abcb005cc4a4'], ['8438447566d4d7bedadc299496ab357426009a35f235cb141be0d99cd10ae3a8', 'c4e1020916980a4da5d01ac5e6ad330734ef0d7906631c4f2390426b2edd791f'], ['4162d488b89402039b584c6fc6c308870587d9c46f660b878ab65c82c711d67e', '67163e903236289f776f22c25fb8a3afc1732f2b84b4e95dbda47ae5a0852649'], ['3fad3fa84caf0f34f0f89bfd2dcf54fc175d767aec3e50684f3ba4a4bf5f683d', 'cd1bc7cb6cc407bb2f0ca647c718a730cf71872e7d0d2a53fa20efcdfe61826'], ['674f2600a3007a00568c1a7ce05d0816c1fb84bf1370798f1c69532faeb1a86b', '299d21f9413f33b3edf43b257004580b70db57da0b182259e09eecc69e0d38a5'], ['d32f4da54ade74abb81b815ad1fb3b263d82d6c692714bcff87d29bd5ee9f08f', 'f9429e738b8e53b968e99016c059707782e14f4535359d582fc416910b3eea87'], ['30e4e670435385556e593657135845d36fbb6931f72b08cb1ed954f1e3ce3ff6', '462f9bce619898638499350113bbc9b10a878d35da70740dc695a559eb88db7b'], ['be2062003c51cc3004682904330e4dee7f3dcd10b01e580bf1971b04d4cad297', '62188bc49d61e5428573d48a74e1c655b1c61090905682a0d5558ed72dccb9bc'], ['93144423ace3451ed29e0fb9ac2af211cb6e84a601df5993c419859fff5df04a', '7c10dfb164c3425f5c71a3f9d7992038f1065224f72bb9d1d902a6d13037b47c'], ['b015f8044f5fcbdcf21ca26d6c34fb8197829205c7b7d2a7cb66418c157b112c', 'ab8c1e086d04e813744a655b2df8d5f83b3cdc6faa3088c1d3aea1454e3a1d5f'], ['d5e9e1da649d97d89e4868117a465a3a4f8a18de57a140d36b3f2af341a21b52', '4cb04437f391ed73111a13cc1d4dd0db1693465c2240480d8955e8592f27447a'], ['d3ae41047dd7ca065dbf8ed77b992439983005cd72e16d6f996a5316d36966bb', 'bd1aeb21ad22ebb22a10f0303417c6d964f8cdd7df0aca614b10dc14d125ac46'], ['463e2763d885f958fc66cdd22800f0a487197d0a82e377b49f80af87c897b065', 'bfefacdb0e5d0fd7df3a311a94de062b26b80c61fbc97508b79992671ef7ca7f'], ['7985fdfd127c0567c6f53ec1bb63ec3158e597c40bfe747c83cddfc910641917', '603c12daf3d9862ef2b25fe1de289aed24ed291e0ec6708703a5bd567f32ed03'], ['74a1ad6b5f76e39db2dd249410eac7f99e74c59cb83d2d0ed5ff1543da7703e9', 'cc6157ef18c9c63cd6193d83631bbea0093e0968942e8c33d5737fd790e0db08'], ['30682a50703375f602d416664ba19b7fc9bab42c72747463a71d0896b22f6da3', '553e04f6b018b4fa6c8f39e7f311d3176290d0e0f19ca73f17714d9977a22ff8'], ['9e2158f0d7c0d5f26c3791efefa79597654e7a2b2464f52b1ee6c1347769ef57', '712fcdd1b9053f09003a3481fa7762e9ffd7c8ef35a38509e2fbf2629008373'], ['176e26989a43c9cfeba4029c202538c28172e566e3c4fce7322857f3be327d66', 'ed8cc9d04b29eb877d270b4878dc43c19aefd31f4eee09ee7b47834c1fa4b1c3'], ['75d46efea3771e6e68abb89a13ad747ecf1892393dfc4f1b7004788c50374da8', '9852390a99507679fd0b86fd2b39a868d7efc22151346e1a3ca4726586a6bed8'], ['809a20c67d64900ffb698c4c825f6d5f2310fb0451c869345b7319f645605721', '9e994980d9917e22b76b061927fa04143d096ccc54963e6a5ebfa5f3f8e286c1'], ['1b38903a43f7f114ed4500b4eac7083fdefece1cf29c63528d563446f972c180', '4036edc931a60ae889353f77fd53de4a2708b26b6f5da72ad3394119daf408f9']]
         }
       };
-    }, {}], 111: [function (require, module, exports) {
+    }, {}], 110: [function (require, module, exports) {
       'use strict';
 
       var utils = exports;
@@ -21995,7 +21989,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         return new BN(bytes, 'hex', 'le');
       }
       utils.intFromLE = intFromLE;
-    }, { "bn.js": 46, "minimalistic-assert": 137, "minimalistic-crypto-utils": 138 }], 112: [function (require, module, exports) {
+    }, { "bn.js": 45, "minimalistic-assert": 136, "minimalistic-crypto-utils": 137 }], 111: [function (require, module, exports) {
       module.exports = {
         "_from": "elliptic@^6.0.0",
         "_id": "elliptic@6.4.0",
@@ -22073,7 +22067,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         },
         "version": "6.4.0"
       };
-    }, {}], 113: [function (require, module, exports) {
+    }, {}], 112: [function (require, module, exports) {
       // Copyright Joyent, Inc. and other Node contributors.
       //
       // Permission is hereby granted, free of charge, to any person obtaining a
@@ -22343,7 +22337,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       function isUndefined(arg) {
         return arg === void 0;
       }
-    }, {}], 114: [function (require, module, exports) {
+    }, {}], 113: [function (require, module, exports) {
       var Buffer = require('safe-buffer').Buffer;
       var MD5 = require('md5.js');
 
@@ -22389,7 +22383,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       }
 
       module.exports = EVP_BytesToKey;
-    }, { "md5.js": 134, "safe-buffer": 174 }], 115: [function (require, module, exports) {
+    }, { "md5.js": 133, "safe-buffer": 173 }], 114: [function (require, module, exports) {
       (function (Buffer) {
         'use strict';
 
@@ -22477,7 +22471,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         module.exports = HashBase;
       }).call(this, require("buffer").Buffer);
-    }, { "buffer": 77, "inherits": 131, "stream": 183 }], 116: [function (require, module, exports) {
+    }, { "buffer": 76, "inherits": 130, "stream": 182 }], 115: [function (require, module, exports) {
       var hash = exports;
 
       hash.utils = require('./hash/utils');
@@ -22493,7 +22487,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       hash.sha384 = hash.sha.sha384;
       hash.sha512 = hash.sha.sha512;
       hash.ripemd160 = hash.ripemd.ripemd160;
-    }, { "./hash/common": 117, "./hash/hmac": 118, "./hash/ripemd": 119, "./hash/sha": 120, "./hash/utils": 127 }], 117: [function (require, module, exports) {
+    }, { "./hash/common": 116, "./hash/hmac": 117, "./hash/ripemd": 118, "./hash/sha": 119, "./hash/utils": 126 }], 116: [function (require, module, exports) {
       'use strict';
 
       var utils = require('./utils');
@@ -22582,7 +22576,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         return res;
       };
-    }, { "./utils": 127, "minimalistic-assert": 137 }], 118: [function (require, module, exports) {
+    }, { "./utils": 126, "minimalistic-assert": 136 }], 117: [function (require, module, exports) {
       'use strict';
 
       var utils = require('./utils');
@@ -22627,7 +22621,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         this.outer.update(this.inner.digest());
         return this.outer.digest(enc);
       };
-    }, { "./utils": 127, "minimalistic-assert": 137 }], 119: [function (require, module, exports) {
+    }, { "./utils": 126, "minimalistic-assert": 136 }], 118: [function (require, module, exports) {
       'use strict';
 
       var utils = require('./utils');
@@ -22711,7 +22705,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       var s = [11, 14, 15, 12, 5, 8, 7, 9, 11, 13, 14, 15, 6, 7, 9, 8, 7, 6, 8, 13, 11, 9, 7, 15, 7, 12, 15, 9, 11, 7, 13, 12, 11, 13, 6, 7, 14, 9, 13, 15, 14, 8, 13, 6, 5, 12, 7, 5, 11, 12, 14, 15, 14, 15, 9, 8, 9, 14, 5, 6, 8, 6, 5, 12, 9, 15, 5, 11, 6, 8, 13, 12, 5, 12, 13, 14, 11, 8, 5, 6];
 
       var sh = [8, 9, 9, 11, 13, 15, 15, 5, 7, 7, 8, 11, 14, 14, 12, 6, 9, 13, 15, 7, 12, 8, 9, 11, 7, 7, 12, 7, 6, 15, 13, 11, 9, 7, 15, 11, 8, 6, 6, 14, 12, 13, 5, 14, 13, 13, 7, 5, 15, 5, 8, 11, 14, 14, 6, 14, 6, 9, 12, 9, 12, 5, 15, 8, 8, 5, 12, 9, 12, 5, 14, 6, 8, 13, 6, 5, 15, 13, 11, 11];
-    }, { "./common": 117, "./utils": 127 }], 120: [function (require, module, exports) {
+    }, { "./common": 116, "./utils": 126 }], 119: [function (require, module, exports) {
       'use strict';
 
       exports.sha1 = require('./sha/1');
@@ -22719,7 +22713,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       exports.sha256 = require('./sha/256');
       exports.sha384 = require('./sha/384');
       exports.sha512 = require('./sha/512');
-    }, { "./sha/1": 121, "./sha/224": 122, "./sha/256": 123, "./sha/384": 124, "./sha/512": 125 }], 121: [function (require, module, exports) {
+    }, { "./sha/1": 120, "./sha/224": 121, "./sha/256": 122, "./sha/384": 123, "./sha/512": 124 }], 120: [function (require, module, exports) {
       'use strict';
 
       var utils = require('../utils');
@@ -22783,7 +22777,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       SHA1.prototype._digest = function digest(enc) {
         if (enc === 'hex') return utils.toHex32(this.h, 'big');else return utils.split32(this.h, 'big');
       };
-    }, { "../common": 117, "../utils": 127, "./common": 126 }], 122: [function (require, module, exports) {
+    }, { "../common": 116, "../utils": 126, "./common": 125 }], 121: [function (require, module, exports) {
       'use strict';
 
       var utils = require('../utils');
@@ -22807,7 +22801,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         // Just truncate output
         if (enc === 'hex') return utils.toHex32(this.h.slice(0, 7), 'big');else return utils.split32(this.h.slice(0, 7), 'big');
       };
-    }, { "../utils": 127, "./256": 123 }], 123: [function (require, module, exports) {
+    }, { "../utils": 126, "./256": 122 }], 122: [function (require, module, exports) {
       'use strict';
 
       var utils = require('../utils');
@@ -22888,7 +22882,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       SHA256.prototype._digest = function digest(enc) {
         if (enc === 'hex') return utils.toHex32(this.h, 'big');else return utils.split32(this.h, 'big');
       };
-    }, { "../common": 117, "../utils": 127, "./common": 126, "minimalistic-assert": 137 }], 124: [function (require, module, exports) {
+    }, { "../common": 116, "../utils": 126, "./common": 125, "minimalistic-assert": 136 }], 123: [function (require, module, exports) {
       'use strict';
 
       var utils = require('../utils');
@@ -22912,7 +22906,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       SHA384.prototype._digest = function digest(enc) {
         if (enc === 'hex') return utils.toHex32(this.h.slice(0, 12), 'big');else return utils.split32(this.h.slice(0, 12), 'big');
       };
-    }, { "../utils": 127, "./512": 125 }], 125: [function (require, module, exports) {
+    }, { "../utils": 126, "./512": 124 }], 124: [function (require, module, exports) {
       'use strict';
 
       var utils = require('../utils');
@@ -23160,7 +23154,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         if (r < 0) r += 0x100000000;
         return r;
       }
-    }, { "../common": 117, "../utils": 127, "minimalistic-assert": 137 }], 126: [function (require, module, exports) {
+    }, { "../common": 116, "../utils": 126, "minimalistic-assert": 136 }], 125: [function (require, module, exports) {
       'use strict';
 
       var utils = require('../utils');
@@ -23207,7 +23201,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         return rotr32(x, 17) ^ rotr32(x, 19) ^ x >>> 10;
       }
       exports.g1_256 = g1_256;
-    }, { "../utils": 127 }], 127: [function (require, module, exports) {
+    }, { "../utils": 126 }], 126: [function (require, module, exports) {
       'use strict';
 
       var assert = require('minimalistic-assert');
@@ -23432,7 +23426,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         return r >>> 0;
       }
       exports.shr64_lo = shr64_lo;
-    }, { "inherits": 131, "minimalistic-assert": 137 }], 128: [function (require, module, exports) {
+    }, { "inherits": 130, "minimalistic-assert": 136 }], 127: [function (require, module, exports) {
       'use strict';
 
       var hash = require('hash.js');
@@ -23534,7 +23528,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         this._reseed++;
         return utils.encode(res, enc);
       };
-    }, { "hash.js": 116, "minimalistic-assert": 137, "minimalistic-crypto-utils": 138 }], 129: [function (require, module, exports) {
+    }, { "hash.js": 115, "minimalistic-assert": 136, "minimalistic-crypto-utils": 137 }], 128: [function (require, module, exports) {
       exports.read = function (buffer, offset, isLE, mLen, nBytes) {
         var e, m;
         var eLen = nBytes * 8 - mLen - 1;
@@ -23619,7 +23613,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         buffer[offset + i - d] |= s * 128;
       };
-    }, {}], 130: [function (require, module, exports) {
+    }, {}], 129: [function (require, module, exports) {
 
       var indexOf = [].indexOf;
 
@@ -23630,7 +23624,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         }
         return -1;
       };
-    }, {}], 131: [function (require, module, exports) {
+    }, {}], 130: [function (require, module, exports) {
       if (typeof Object.create === 'function') {
         // implementation from standard node.js 'util' module
         module.exports = function inherits(ctor, superCtor) {
@@ -23654,7 +23648,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           ctor.prototype.constructor = ctor;
         };
       }
-    }, {}], 132: [function (require, module, exports) {
+    }, {}], 131: [function (require, module, exports) {
       /*!
        * Determine if an object is a Buffer
        *
@@ -23676,13 +23670,13 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       function isSlowBuffer(obj) {
         return typeof obj.readFloatLE === 'function' && typeof obj.slice === 'function' && isBuffer(obj.slice(0, 0));
       }
-    }, {}], 133: [function (require, module, exports) {
+    }, {}], 132: [function (require, module, exports) {
       var toString = {}.toString;
 
       module.exports = Array.isArray || function (arr) {
         return toString.call(arr) == '[object Array]';
       };
-    }, {}], 134: [function (require, module, exports) {
+    }, {}], 133: [function (require, module, exports) {
       (function (Buffer) {
         'use strict';
 
@@ -23831,7 +23825,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         module.exports = MD5;
       }).call(this, require("buffer").Buffer);
-    }, { "buffer": 77, "hash-base": 135, "inherits": 131 }], 135: [function (require, module, exports) {
+    }, { "buffer": 76, "hash-base": 134, "inherits": 130 }], 134: [function (require, module, exports) {
       'use strict';
 
       var Buffer = require('safe-buffer').Buffer;
@@ -23929,7 +23923,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       };
 
       module.exports = HashBase;
-    }, { "inherits": 131, "safe-buffer": 174, "stream": 183 }], 136: [function (require, module, exports) {
+    }, { "inherits": 130, "safe-buffer": 173, "stream": 182 }], 135: [function (require, module, exports) {
       var bn = require('bn.js');
       var brorand = require('brorand');
 
@@ -24034,7 +24028,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         return false;
       };
-    }, { "bn.js": 46, "brorand": 47 }], 137: [function (require, module, exports) {
+    }, { "bn.js": 45, "brorand": 46 }], 136: [function (require, module, exports) {
       module.exports = assert;
 
       function assert(val, msg) {
@@ -24044,7 +24038,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       assert.equal = function assertEqual(l, r, msg) {
         if (l != r) throw new Error(msg || 'Assertion failed: ' + l + ' != ' + r);
       };
-    }, {}], 138: [function (require, module, exports) {
+    }, {}], 137: [function (require, module, exports) {
       'use strict';
 
       var utils = exports;
@@ -24092,7 +24086,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       utils.encode = function encode(arr, enc) {
         if (enc === 'hex') return toHex(arr);else return arr;
       };
-    }, {}], 139: [function (require, module, exports) {
+    }, {}], 138: [function (require, module, exports) {
       module.exports = { "2.16.840.1.101.3.4.1.1": "aes-128-ecb",
         "2.16.840.1.101.3.4.1.2": "aes-128-cbc",
         "2.16.840.1.101.3.4.1.3": "aes-128-ofb",
@@ -24106,7 +24100,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         "2.16.840.1.101.3.4.1.43": "aes-256-ofb",
         "2.16.840.1.101.3.4.1.44": "aes-256-cfb"
       };
-    }, {}], 140: [function (require, module, exports) {
+    }, {}], 139: [function (require, module, exports) {
       // from https://github.com/indutny/self-signed/blob/gh-pages/lib/asn1.js
       // Fedor, you are amazing.
       'use strict';
@@ -24167,7 +24161,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       exports.signature = asn1.define('signature', function () {
         this.seq().obj(this.key('r').int(), this.key('s').int());
       });
-    }, { "./certificate": 141, "asn1.js": 31 }], 141: [function (require, module, exports) {
+    }, { "./certificate": 140, "asn1.js": 30 }], 140: [function (require, module, exports) {
       // from https://github.com/Rantanen/node-dtls/blob/25a7dc861bda38cfeac93a723500eea4f0ac2e86/Certificate.js
       // thanks to @Rantanen
 
@@ -24225,7 +24219,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       });
 
       module.exports = X509Certificate;
-    }, { "asn1.js": 31 }], 142: [function (require, module, exports) {
+    }, { "asn1.js": 30 }], 141: [function (require, module, exports) {
       (function (Buffer) {
         // adapted from https://github.com/apatil/pemstrip
         var findProc = /Proc-Type: 4,ENCRYPTED\n\r?DEK-Info: AES-((?:128)|(?:192)|(?:256))-CBC,([0-9A-H]+)\n\r?\n\r?([0-9A-z\n\r\+\/\=]+)\n\r?/m;
@@ -24258,7 +24252,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           };
         };
       }).call(this, require("buffer").Buffer);
-    }, { "browserify-aes": 51, "buffer": 77, "evp_bytestokey": 114 }], 143: [function (require, module, exports) {
+    }, { "browserify-aes": 50, "buffer": 76, "evp_bytestokey": 113 }], 142: [function (require, module, exports) {
       (function (Buffer) {
         var asn1 = require('./asn1');
         var aesid = require('./aesid.json');
@@ -24370,7 +24364,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return Buffer.concat(out);
         }
       }).call(this, require("buffer").Buffer);
-    }, { "./aesid.json": 139, "./asn1": 140, "./fixProc": 142, "browserify-aes": 51, "buffer": 77, "pbkdf2": 145 }], 144: [function (require, module, exports) {
+    }, { "./aesid.json": 138, "./asn1": 139, "./fixProc": 141, "browserify-aes": 50, "buffer": 76, "pbkdf2": 144 }], 143: [function (require, module, exports) {
       (function (process) {
         // Copyright Joyent, Inc. and other Node contributors.
         //
@@ -24592,12 +24586,12 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return str.substr(start, len);
         };
       }).call(this, require('_process'));
-    }, { "_process": 151 }], 145: [function (require, module, exports) {
+    }, { "_process": 150 }], 144: [function (require, module, exports) {
 
       exports.pbkdf2 = require('./lib/async');
 
       exports.pbkdf2Sync = require('./lib/sync');
-    }, { "./lib/async": 146, "./lib/sync": 149 }], 146: [function (require, module, exports) {
+    }, { "./lib/async": 145, "./lib/sync": 148 }], 145: [function (require, module, exports) {
       (function (process, global) {
         var checkParameters = require('./precondition');
         var defaultEncoding = require('./default-encoding');
@@ -24695,7 +24689,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           }), callback);
         };
       }).call(this, require('_process'), typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {});
-    }, { "./default-encoding": 147, "./precondition": 148, "./sync": 149, "_process": 151, "safe-buffer": 174 }], 147: [function (require, module, exports) {
+    }, { "./default-encoding": 146, "./precondition": 147, "./sync": 148, "_process": 150, "safe-buffer": 173 }], 146: [function (require, module, exports) {
       (function (process) {
         var defaultEncoding;
         /* istanbul ignore next */
@@ -24708,7 +24702,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         }
         module.exports = defaultEncoding;
       }).call(this, require('_process'));
-    }, { "_process": 151 }], 148: [function (require, module, exports) {
+    }, { "_process": 150 }], 147: [function (require, module, exports) {
       var MAX_ALLOC = Math.pow(2, 30) - 1; // default in iojs
       module.exports = function (iterations, keylen) {
         if (typeof iterations !== 'number') {
@@ -24728,7 +24722,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           throw new TypeError('Bad key length');
         }
       };
-    }, {}], 149: [function (require, module, exports) {
+    }, {}], 148: [function (require, module, exports) {
       var md5 = require('create-hash/md5');
       var rmd160 = require('ripemd160');
       var sha = require('sha.js');
@@ -24832,7 +24826,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       }
 
       module.exports = pbkdf2;
-    }, { "./default-encoding": 147, "./precondition": 148, "create-hash/md5": 83, "ripemd160": 173, "safe-buffer": 174, "sha.js": 176 }], 150: [function (require, module, exports) {
+    }, { "./default-encoding": 146, "./precondition": 147, "create-hash/md5": 82, "ripemd160": 172, "safe-buffer": 173, "sha.js": 175 }], 149: [function (require, module, exports) {
       (function (process) {
         'use strict';
 
@@ -24876,7 +24870,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           }
         }
       }).call(this, require('_process'));
-    }, { "_process": 151 }], 151: [function (require, module, exports) {
+    }, { "_process": 150 }], 150: [function (require, module, exports) {
       // shim for using process in browser
       var process = module.exports = {};
 
@@ -25062,7 +25056,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       process.umask = function () {
         return 0;
       };
-    }, {}], 152: [function (require, module, exports) {
+    }, {}], 151: [function (require, module, exports) {
       exports.publicEncrypt = require('./publicEncrypt');
       exports.privateDecrypt = require('./privateDecrypt');
 
@@ -25073,7 +25067,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       exports.publicDecrypt = function publicDecrypt(key, buf) {
         return exports.privateDecrypt(key, buf, true);
       };
-    }, { "./privateDecrypt": 154, "./publicEncrypt": 155 }], 153: [function (require, module, exports) {
+    }, { "./privateDecrypt": 153, "./publicEncrypt": 154 }], 152: [function (require, module, exports) {
       (function (Buffer) {
         var createHash = require('create-hash');
         module.exports = function (seed, len) {
@@ -25093,7 +25087,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return out;
         }
       }).call(this, require("buffer").Buffer);
-    }, { "buffer": 77, "create-hash": 81 }], 154: [function (require, module, exports) {
+    }, { "buffer": 76, "create-hash": 80 }], 153: [function (require, module, exports) {
       (function (Buffer) {
         var parseKeys = require('parse-asn1');
         var mgf = require('./mgf');
@@ -25204,7 +25198,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return dif;
         }
       }).call(this, require("buffer").Buffer);
-    }, { "./mgf": 153, "./withPublic": 156, "./xor": 157, "bn.js": 46, "browserify-rsa": 69, "buffer": 77, "create-hash": 81, "parse-asn1": 143 }], 155: [function (require, module, exports) {
+    }, { "./mgf": 152, "./withPublic": 155, "./xor": 156, "bn.js": 45, "browserify-rsa": 68, "buffer": 76, "create-hash": 80, "parse-asn1": 142 }], 154: [function (require, module, exports) {
       (function (Buffer) {
         var parseKeys = require('parse-asn1');
         var randomBytes = require('randombytes');
@@ -25302,7 +25296,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return out;
         }
       }).call(this, require("buffer").Buffer);
-    }, { "./mgf": 153, "./withPublic": 156, "./xor": 157, "bn.js": 46, "browserify-rsa": 69, "buffer": 77, "create-hash": 81, "parse-asn1": 143, "randombytes": 159 }], 156: [function (require, module, exports) {
+    }, { "./mgf": 152, "./withPublic": 155, "./xor": 156, "bn.js": 45, "browserify-rsa": 68, "buffer": 76, "create-hash": 80, "parse-asn1": 142, "randombytes": 158 }], 155: [function (require, module, exports) {
       (function (Buffer) {
         var bn = require('bn.js');
         function withPublic(paddedMsg, key) {
@@ -25311,7 +25305,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         module.exports = withPublic;
       }).call(this, require("buffer").Buffer);
-    }, { "bn.js": 46, "buffer": 77 }], 157: [function (require, module, exports) {
+    }, { "bn.js": 45, "buffer": 76 }], 156: [function (require, module, exports) {
       module.exports = function xor(a, b) {
         var len = a.length;
         var i = -1;
@@ -25320,7 +25314,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         }
         return a;
       };
-    }, {}], 158: [function (require, module, exports) {
+    }, {}], 157: [function (require, module, exports) {
       (function (global) {
         /*! https://mths.be/punycode v1.4.1 by @mathias */
         ;(function (root) {
@@ -25848,7 +25842,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           }
         })(this);
       }).call(this, typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {});
-    }, {}], 159: [function (require, module, exports) {
+    }, {}], 158: [function (require, module, exports) {
       (function (process, global) {
         'use strict';
 
@@ -25890,9 +25884,9 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return bytes;
         }
       }).call(this, require('_process'), typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {});
-    }, { "_process": 151, "safe-buffer": 174 }], 160: [function (require, module, exports) {
+    }, { "_process": 150, "safe-buffer": 173 }], 159: [function (require, module, exports) {
       module.exports = require('./lib/_stream_duplex.js');
-    }, { "./lib/_stream_duplex.js": 161 }], 161: [function (require, module, exports) {
+    }, { "./lib/_stream_duplex.js": 160 }], 160: [function (require, module, exports) {
       // Copyright Joyent, Inc. and other Node contributors.
       //
       // Permission is hereby granted, free of charge, to any person obtaining a
@@ -26017,7 +26011,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           f(xs[i], i);
         }
       }
-    }, { "./_stream_readable": 163, "./_stream_writable": 165, "core-util-is": 79, "inherits": 131, "process-nextick-args": 150 }], 162: [function (require, module, exports) {
+    }, { "./_stream_readable": 162, "./_stream_writable": 164, "core-util-is": 78, "inherits": 130, "process-nextick-args": 149 }], 161: [function (require, module, exports) {
       // Copyright Joyent, Inc. and other Node contributors.
       //
       // Permission is hereby granted, free of charge, to any person obtaining a
@@ -26065,7 +26059,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       PassThrough.prototype._transform = function (chunk, encoding, cb) {
         cb(null, chunk);
       };
-    }, { "./_stream_transform": 164, "core-util-is": 79, "inherits": 131 }], 163: [function (require, module, exports) {
+    }, { "./_stream_transform": 163, "core-util-is": 78, "inherits": 130 }], 162: [function (require, module, exports) {
       (function (process, global) {
         // Copyright Joyent, Inc. and other Node contributors.
         //
@@ -27075,7 +27069,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return -1;
         }
       }).call(this, require('_process'), typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {});
-    }, { "./_stream_duplex": 161, "./internal/streams/BufferList": 166, "./internal/streams/destroy": 167, "./internal/streams/stream": 168, "_process": 151, "core-util-is": 79, "events": 113, "inherits": 131, "isarray": 133, "process-nextick-args": 150, "safe-buffer": 174, "string_decoder/": 184, "util": 48 }], 164: [function (require, module, exports) {
+    }, { "./_stream_duplex": 160, "./internal/streams/BufferList": 165, "./internal/streams/destroy": 166, "./internal/streams/stream": 167, "_process": 150, "core-util-is": 78, "events": 112, "inherits": 130, "isarray": 132, "process-nextick-args": 149, "safe-buffer": 173, "string_decoder/": 183, "util": 47 }], 163: [function (require, module, exports) {
       // Copyright Joyent, Inc. and other Node contributors.
       //
       // Permission is hereby granted, free of charge, to any person obtaining a
@@ -27290,7 +27284,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         return stream.push(null);
       }
-    }, { "./_stream_duplex": 161, "core-util-is": 79, "inherits": 131 }], 165: [function (require, module, exports) {
+    }, { "./_stream_duplex": 160, "core-util-is": 78, "inherits": 130 }], 164: [function (require, module, exports) {
       (function (process, global) {
         // Copyright Joyent, Inc. and other Node contributors.
         //
@@ -27957,7 +27951,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           cb(err);
         };
       }).call(this, require('_process'), typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {});
-    }, { "./_stream_duplex": 161, "./internal/streams/destroy": 167, "./internal/streams/stream": 168, "_process": 151, "core-util-is": 79, "inherits": 131, "process-nextick-args": 150, "safe-buffer": 174, "util-deprecate": 185 }], 166: [function (require, module, exports) {
+    }, { "./_stream_duplex": 160, "./internal/streams/destroy": 166, "./internal/streams/stream": 167, "_process": 150, "core-util-is": 78, "inherits": 130, "process-nextick-args": 149, "safe-buffer": 173, "util-deprecate": 184 }], 165: [function (require, module, exports) {
       'use strict';
 
       /*<replacement>*/
@@ -28036,7 +28030,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         return BufferList;
       }();
-    }, { "safe-buffer": 174 }], 167: [function (require, module, exports) {
+    }, { "safe-buffer": 173 }], 166: [function (require, module, exports) {
       'use strict';
 
       /*<replacement>*/
@@ -28109,11 +28103,11 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         destroy: destroy,
         undestroy: undestroy
       };
-    }, { "process-nextick-args": 150 }], 168: [function (require, module, exports) {
+    }, { "process-nextick-args": 149 }], 167: [function (require, module, exports) {
       module.exports = require('events').EventEmitter;
-    }, { "events": 113 }], 169: [function (require, module, exports) {
+    }, { "events": 112 }], 168: [function (require, module, exports) {
       module.exports = require('./readable').PassThrough;
-    }, { "./readable": 170 }], 170: [function (require, module, exports) {
+    }, { "./readable": 169 }], 169: [function (require, module, exports) {
       exports = module.exports = require('./lib/_stream_readable.js');
       exports.Stream = exports;
       exports.Readable = exports;
@@ -28121,11 +28115,11 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       exports.Duplex = require('./lib/_stream_duplex.js');
       exports.Transform = require('./lib/_stream_transform.js');
       exports.PassThrough = require('./lib/_stream_passthrough.js');
-    }, { "./lib/_stream_duplex.js": 161, "./lib/_stream_passthrough.js": 162, "./lib/_stream_readable.js": 163, "./lib/_stream_transform.js": 164, "./lib/_stream_writable.js": 165 }], 171: [function (require, module, exports) {
+    }, { "./lib/_stream_duplex.js": 160, "./lib/_stream_passthrough.js": 161, "./lib/_stream_readable.js": 162, "./lib/_stream_transform.js": 163, "./lib/_stream_writable.js": 164 }], 170: [function (require, module, exports) {
       module.exports = require('./readable').Transform;
-    }, { "./readable": 170 }], 172: [function (require, module, exports) {
+    }, { "./readable": 169 }], 171: [function (require, module, exports) {
       module.exports = require('./lib/_stream_writable.js');
-    }, { "./lib/_stream_writable.js": 165 }], 173: [function (require, module, exports) {
+    }, { "./lib/_stream_writable.js": 164 }], 172: [function (require, module, exports) {
       (function (Buffer) {
         'use strict';
 
@@ -28420,7 +28414,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
 
         module.exports = RIPEMD160;
       }).call(this, require("buffer").Buffer);
-    }, { "buffer": 77, "hash-base": 115, "inherits": 131 }], 174: [function (require, module, exports) {
+    }, { "buffer": 76, "hash-base": 114, "inherits": 130 }], 173: [function (require, module, exports) {
       /* eslint-disable node/no-deprecated-api */
       var buffer = require('buffer');
       var Buffer = buffer.Buffer;
@@ -28483,7 +28477,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         }
         return buffer.SlowBuffer(size);
       };
-    }, { "buffer": 77 }], 175: [function (require, module, exports) {
+    }, { "buffer": 76 }], 174: [function (require, module, exports) {
       var Buffer = require('safe-buffer').Buffer;
 
       // prototype class for hash functions
@@ -28565,7 +28559,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       };
 
       module.exports = Hash;
-    }, { "safe-buffer": 174 }], 176: [function (require, module, exports) {
+    }, { "safe-buffer": 173 }], 175: [function (require, module, exports) {
       var exports = module.exports = function SHA(algorithm) {
         algorithm = algorithm.toLowerCase();
 
@@ -28581,7 +28575,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       exports.sha256 = require('./sha256');
       exports.sha384 = require('./sha384');
       exports.sha512 = require('./sha512');
-    }, { "./sha": 177, "./sha1": 178, "./sha224": 179, "./sha256": 180, "./sha384": 181, "./sha512": 182 }], 177: [function (require, module, exports) {
+    }, { "./sha": 176, "./sha1": 177, "./sha224": 178, "./sha256": 179, "./sha384": 180, "./sha512": 181 }], 176: [function (require, module, exports) {
       /*
        * A JavaScript implementation of the Secure Hash Algorithm, SHA-0, as defined
        * in FIPS PUB 180-1
@@ -28675,7 +28669,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       };
 
       module.exports = Sha;
-    }, { "./hash": 175, "inherits": 131, "safe-buffer": 174 }], 178: [function (require, module, exports) {
+    }, { "./hash": 174, "inherits": 130, "safe-buffer": 173 }], 177: [function (require, module, exports) {
       /*
        * A JavaScript implementation of the Secure Hash Algorithm, SHA-1, as defined
        * in FIPS PUB 180-1
@@ -28774,7 +28768,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       };
 
       module.exports = Sha1;
-    }, { "./hash": 175, "inherits": 131, "safe-buffer": 174 }], 179: [function (require, module, exports) {
+    }, { "./hash": 174, "inherits": 130, "safe-buffer": 173 }], 178: [function (require, module, exports) {
       /**
        * A JavaScript implementation of the Secure Hash Algorithm, SHA-256, as defined
        * in FIPS 180-2
@@ -28828,7 +28822,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       };
 
       module.exports = Sha224;
-    }, { "./hash": 175, "./sha256": 180, "inherits": 131, "safe-buffer": 174 }], 180: [function (require, module, exports) {
+    }, { "./hash": 174, "./sha256": 179, "inherits": 130, "safe-buffer": 173 }], 179: [function (require, module, exports) {
       /**
        * A JavaScript implementation of the Secure Hash Algorithm, SHA-256, as defined
        * in FIPS 180-2
@@ -28948,7 +28942,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       };
 
       module.exports = Sha256;
-    }, { "./hash": 175, "inherits": 131, "safe-buffer": 174 }], 181: [function (require, module, exports) {
+    }, { "./hash": 174, "inherits": 130, "safe-buffer": 173 }], 180: [function (require, module, exports) {
       var inherits = require('inherits');
       var SHA512 = require('./sha512');
       var Hash = require('./hash');
@@ -29006,7 +29000,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       };
 
       module.exports = Sha384;
-    }, { "./hash": 175, "./sha512": 182, "inherits": 131, "safe-buffer": 174 }], 182: [function (require, module, exports) {
+    }, { "./hash": 174, "./sha512": 181, "inherits": 130, "safe-buffer": 173 }], 181: [function (require, module, exports) {
       var inherits = require('inherits');
       var Hash = require('./hash');
       var Buffer = require('safe-buffer').Buffer;
@@ -29226,7 +29220,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       };
 
       module.exports = Sha512;
-    }, { "./hash": 175, "inherits": 131, "safe-buffer": 174 }], 183: [function (require, module, exports) {
+    }, { "./hash": 174, "inherits": 130, "safe-buffer": 173 }], 182: [function (require, module, exports) {
       // Copyright Joyent, Inc. and other Node contributors.
       //
       // Permission is hereby granted, free of charge, to any person obtaining a
@@ -29351,7 +29345,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         // Allow for unix-like usage: A.pipe(B).pipe(C)
         return dest;
       };
-    }, { "events": 113, "inherits": 131, "readable-stream/duplex.js": 160, "readable-stream/passthrough.js": 169, "readable-stream/readable.js": 170, "readable-stream/transform.js": 171, "readable-stream/writable.js": 172 }], 184: [function (require, module, exports) {
+    }, { "events": 112, "inherits": 130, "readable-stream/duplex.js": 159, "readable-stream/passthrough.js": 168, "readable-stream/readable.js": 169, "readable-stream/transform.js": 170, "readable-stream/writable.js": 171 }], 183: [function (require, module, exports) {
       'use strict';
 
       var Buffer = require('safe-buffer').Buffer;
@@ -29624,7 +29618,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
       function simpleEnd(buf) {
         return buf && buf.length ? this.write(buf) : '';
       }
-    }, { "safe-buffer": 174 }], 185: [function (require, module, exports) {
+    }, { "safe-buffer": 173 }], 184: [function (require, module, exports) {
       (function (global) {
 
         /**
@@ -29694,13 +29688,13 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return String(val).toLowerCase() === 'true';
         }
       }).call(this, typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {});
-    }, {}], 186: [function (require, module, exports) {
-      arguments[4][131][0].apply(exports, arguments);
-    }, { "dup": 131 }], 187: [function (require, module, exports) {
+    }, {}], 185: [function (require, module, exports) {
+      arguments[4][130][0].apply(exports, arguments);
+    }, { "dup": 130 }], 186: [function (require, module, exports) {
       module.exports = function isBuffer(arg) {
         return arg && (typeof arg === "undefined" ? "undefined" : _typeof(arg)) === 'object' && typeof arg.copy === 'function' && typeof arg.fill === 'function' && typeof arg.readUInt8 === 'function';
       };
-    }, {}], 188: [function (require, module, exports) {
+    }, {}], 187: [function (require, module, exports) {
       (function (process, global) {
         // Copyright Joyent, Inc. and other Node contributors.
         //
@@ -30247,7 +30241,7 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
           return Object.prototype.hasOwnProperty.call(obj, prop);
         }
       }).call(this, require('_process'), typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {});
-    }, { "./support/isBuffer": 187, "_process": 151, "inherits": 186 }], 189: [function (require, module, exports) {
+    }, { "./support/isBuffer": 186, "_process": 150, "inherits": 185 }], 188: [function (require, module, exports) {
       var indexOf = require('indexof');
 
       var Object_keys = function Object_keys(obj) {
@@ -30382,5 +30376,5 @@ function _classCallCheck2(instance, Constructor) { if (!(instance instanceof Con
         }
         return copy;
       };
-    }, { "indexof": 130 }] }, {}, [6])(6);
+    }, { "indexof": 129 }] }, {}, [6])(6);
 });
